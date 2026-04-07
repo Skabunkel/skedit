@@ -1,0 +1,10 @@
+rust_library(
+    name = 'greeting',
+    srcs = ["greeting.rs"],
+    deps = [":join"],
+)
+
+rust_binary(
+    name = "main",
+    srcs = ["src/main.rs"],
+)

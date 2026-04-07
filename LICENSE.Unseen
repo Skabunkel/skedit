@@ -1,0 +1,82 @@
+Unseen University (UU) License
+
+Copyright (c) 2026 Ska-Bunkel
+Faculty of Digital Thaumaturgy, Unseen University
+
+Preamble
+--------
+This document exists primarily so that everyone may feel comfortable that
+there *is* a license, which is widely regarded as an important thing for a
+piece of software to possess. However, the Faculty has long held the opinion
+that serious legal matters are best handled by people who enjoy that sort of
+thing, preferably in another file.
+
+Accordingly, this license concerns itself mainly with good manners,
+scholarly sharing, and the general encouragement of digital thaumaturgy.
+
+Definitions
+-----------
+"Grimoire" shall refer to this software and any associated documentation,
+scripts, diagrams, mysterious comments in the source code, or other arcane
+materials bundled alongside it.
+
+"Practitioner of Digital Thaumaturgy" shall refer to any individual, group,
+guild, or sufficiently self-aware automaton who obtains a copy of the
+Grimoire.
+
+Grant of Permission
+-------------------
+Permission is hereby granted, free of charge, to any practitioner of digital
+thaumaturgy obtaining a copy of this software and associated documentation
+files (the "Grimoire"), to deal in the Grimoire without restriction,
+including without limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of the Grimoire, and to
+permit persons to whom the Grimoire is furnished to do so.
+
+The Faculty generally encourages such activity, provided that it does not
+explode the University, the city, or the surrounding countryside.
+
+Conditions
+----------
+1. The above copyright notice and this permission notice shall be included in
+   all copies or substantial portions of the Grimoire, preferably intact and
+   not hidden behind suspiciously small font sizes.
+
+2. Where any other license file exists within this repository (including but
+   not limited to MIT, Apache 2.0, BSD, GPL, or any license yet to be
+   invented by the Department of Post-Mortem Communications), said license
+   shall take precedence over this one in all matters of legal specificity,
+   enforceability, and terrifyingly precise wording.
+
+3. In the absence of such a license, readers are encouraged to behave in the
+   spirit of collegial scholarship: share improvements, avoid unnecessary
+   villainy, and do not claim authorship unless you actually wrote the
+   thing.*
+
+4. The Archchancellor reserves the right to alter these terms at any time,
+   particularly around mealtimes, after long lunches, or when feeling
+   magnanimous.
+
+   *This clause has historically proven difficult for wizards.
+
+Disclaimer
+----------
+THE GRIMOIRE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF THAUMIC STABILITY,
+FITNESS FOR A PARTICULAR SPELL, AND NONINFRINGEMENT OF THE LAWS OF NARRATIVE
+CAUSALITY.
+
+IN NO EVENT SHALL THE AUTHORS, COPYRIGHT HOLDERS, THE FACULTY OF DIGITAL
+THAUMATURGY, THE ARCHCHANCELLOR, OR THE BURSAR (WHO IS ALREADY HAVING A VERY
+DIFFICULT DAY) BE HELD LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY,
+WHETHER IN AN ACTION OF CONTRACT, MAGICAL MISHAP, COMPUTATIONAL PARADOX, OR
+OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE GRIMOIRE OR THE
+USE OR OTHER DEALINGS IN THE GRIMOIRE.
+
+Final Note
+----------
+If this license appears confusing, contradictory, or suspiciously brief in
+places, that is intentional. Any serious legal interpretation should defer
+to whichever proper license accompanies the Grimoire elsewhere in the
+repository. The Faculty feels strongly that someone else should deal with
+that sort of thing.

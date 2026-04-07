@@ -1,0 +1,16 @@
+rust_binary(
+    name = "main",
+    srcs = ["src/main.rs"],
+    deps = [
+        ":bar",
+        ":foo",
+        ":test",
+    ],
+)
+
+
+rust_library(
+    name = 'greeting',
+    srcs = ["greeting.rs"],
+    deps = [":test"],
+)
