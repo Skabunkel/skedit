@@ -88,7 +88,7 @@ And I haven't even gotten started on things like building container images with 
 
 I would want it to look something like this. I created a PenPot sketch then i gave that to Claude, then updated my design with stuff i liked from his output and then sent it back.
 Claude seems obsessed with VScode because i had to remove VSCode-ish asspects again, again and again. 
-I used some assets from another dream project, a code hosting site called i call Bofink. 
+I used some assets from another dream project, a code hosting site i call Bofink. 
 So thats why it keeps doing the bird stuff. There might be some Bofink refrences left that i have missed. `<_<`
 
 Did i mention it keeps creating VSCode.
