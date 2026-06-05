@@ -84,3 +84,25 @@ And I haven't even gotten started on things like building container images with 
 * How do I communicate what files belong in what target?
 * Will I finish this list before running off to something else?
 
+### When i wish upon a star
+
+I would want it to look something like this. I created a PenPot sketch then i gave that to Claude, then updated my design with stuff i liked from his output and then sent it back.
+Claude seems obsessed with VScode because i had to remove VSCode-ish asspects again, again and again. 
+I used some assets from another dream project, a code hosting site called i call Bofink. 
+So thats why it keeps doing the bird stuff. There might be some Bofink refrences left that i have missed. `<_<`
+
+Did i mention it keeps creating VSCode.
+
+*Things i dont like*
+I wanted something like zeds row and character position and language in the bottom right but keeps ignoring it.
+
+
+*Insperations* 
+* [Obsidian](https://obsidian.md/)
+* [Zed](https://zed.dev/)
+* Jetbrains Rider
+* [Halloy](https://github.com/squidowl/halloy)
+
+
+![The code view](00_moc_code_view.png)
+![The project view](01_moc_project_view.png)
