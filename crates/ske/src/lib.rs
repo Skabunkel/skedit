@@ -1,6 +1,7 @@
+pub mod buck;
+pub mod dirs;
 pub mod index;
 pub mod template;
-pub mod buck;
 
 use std::fmt;
 

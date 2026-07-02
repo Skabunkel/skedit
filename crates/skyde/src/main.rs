@@ -1,5 +1,8 @@
+mod big;
 mod graph;
 mod gutter;
+mod piece;
+mod recent;
 mod tree;
 
 use std::path::{Path, PathBuf};
@@ -23,6 +26,14 @@ const NERD_FONT: Font = Font::with_name("MesloLGM Nerd Font Mono");
 
 /// Widget id of the context menu's new-file/new-folder name input.
 const NEW_ENTRY_INPUT: &str = "ctx-new-entry";
+/// Widget id of the command palette's search input.
+const PALETTE_INPUT: &str = "palette-input";
+
+/// Above this size we skip syntax highlighting (goal.md #5)…
+const HIGHLIGHT_MAX_BYTES: u64 = 512 * 1024;
+/// …and above this one the file opens in the streaming piece-table editor
+/// instead of the normal text editor (goal.md #7).
+const BIG_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
 // Nerd Font codepoints. If a glyph renders as a box, swap the codepoint here.
 const ICON_CHEVRON_RIGHT: &str = "\u{eab6}"; // nf-cod-chevron_right
@@ -80,6 +91,11 @@ struct Buffer {
     // publishes — iced doesn't expose its internal scroll, and the gutter
     // needs it to stay lined up.
     scroll: f32,
+    // false for large files: syntect on megabytes is what made them slow.
+    highlight: bool,
+    // Super-large files skip `content` entirely and live in a streamed
+    // piece table rendered by `big::View`.
+    big: Option<big::BigBuffer>,
 }
 
 impl Buffer {
@@ -90,6 +106,8 @@ impl Buffer {
             dirty: false,
             syntax: "txt".into(),
             scroll: 0.0,
+            highlight: true,
+            big: None,
         }
     }
 
@@ -128,11 +146,26 @@ struct Skyde {
     // Height of the editor's text area, measured in view() by `responsive` —
     // update() needs it to clamp scroll the same way cosmic-text does.
     editor_text_h: std::cell::Cell<f32>,
+    // Approx visible columns of the big-file editor, for horizontal follow.
+    editor_cols: std::cell::Cell<usize>,
     // Last cursor position in window coordinates, for placing the context
     // menu. mouse_area's right-press message carries no position.
     cursor: Point,
     context: Option<(Point, CtxKind)>,
     new_entry: String,
+    // Template picked in the new-workspace dialog (by template name).
+    new_ws_template: Option<String>,
+    // Snapshot shown by the recent-workspaces dialog.
+    recents: Vec<recent::Entry>,
+    palette: Option<Palette>,
+}
+
+/// Command palette state (goal.md #8).
+struct Palette {
+    input: String,
+    index: usize,
+    /// Workspace files collected when the palette opened.
+    files: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,6 +227,20 @@ enum Message {
     SelectTargetByLabel(String),
     WorkspacePrompt { create: bool },
     WorkspaceSet,
+    WorkspaceTemplate(String),
+    RecentsShow,
+    RecentOpen(PathBuf),
+    TemplateAddPrompt,
+    TemplateAddRun,
+    TemplateInstalled(Result<String, String>),
+    GoToPrompt,
+    GoToLine,
+    PaletteOpen,
+    PaletteInput(String),
+    PaletteNav(i32),
+    PaletteRun(Option<usize>),
+    Big(big::Action),
+    BigLoad(PathBuf, big::Load),
 }
 
 /// One line / completion event from a streaming `buck2 build`.
@@ -213,8 +260,19 @@ enum CtxKind {
     NewEntry { dir: PathBuf, folder: bool },
     /// The titlebar File menu (reuses the context-menu plumbing).
     FileMenu,
-    /// Path prompt for creating/opening a workspace.
+    /// The titlebar Edit menu.
+    EditMenu,
+    /// The titlebar Go menu.
+    GoMenu,
+    /// Path prompt for creating/opening a workspace; creating also offers a
+    /// template to scaffold from (goal.md #2).
     Workspace { create: bool },
+    /// The recently-opened-workspaces dialog (goal.md #3).
+    Recents,
+    /// Prompt for a template source: local path, http(s) url, or git repo.
+    TemplateAdd,
+    /// Go-to-line prompt (goal.md #6).
+    GoTo,
 }
 
 /// Mirror cosmic-text's keep-the-cursor-in-view behaviour so the gutter
@@ -312,7 +370,9 @@ fn language_name(syntax: &str) -> &'static str {
 
 impl Skyde {
     fn new() -> (Self, Task<Message>) {
+        seed_user_templates();
         let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        recent::touch(&root);
         let tree = tree::read_dir(&root);
         let buck_root = ske::buck::find_root(&root);
         let load = match buck_root.clone() {
@@ -360,9 +420,13 @@ impl Skyde {
             console: None,
             building: false,
             editor_text_h: std::cell::Cell::new(600.0),
+            editor_cols: std::cell::Cell::new(120),
             cursor: Point::ORIGIN,
             context: None,
             new_entry: String::new(),
+            new_ws_template: None,
+            recents: Vec::new(),
+            palette: None,
         };
         // `skyde path/to/file` opens it on startup.
         let open = std::env::args()
@@ -372,7 +436,24 @@ impl Skyde {
             .find(|p| p.is_file())
             .map(|p| Task::done(Message::Open(p)))
             .unwrap_or_else(Task::none);
-        (app, Task::batch([load, open]))
+        // Debug aid: `--ui palette|recents|goto|newws|edit` opens that
+        // overlay on startup (useful for screenshots; no input injection
+        // on Wayland).
+        let mut args = std::env::args();
+        let mut ui = Task::none();
+        while let Some(a) = args.next() {
+            if a == "--ui" {
+                ui = match args.next().as_deref() {
+                    Some("palette") => Task::done(Message::PaletteOpen),
+                    Some("recents") => Task::done(Message::RecentsShow),
+                    Some("goto") => Task::done(Message::GoToPrompt),
+                    Some("newws") => Task::done(Message::WorkspacePrompt { create: true }),
+                    Some("edit") => Task::done(Message::Menu("Edit")),
+                    _ => Task::none(),
+                };
+            }
+        }
+        (app, Task::batch([load, open, ui]))
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -385,12 +466,20 @@ impl Skyde {
                     keyboard::Key::Character("s") => Some(Message::Save),
                     keyboard::Key::Character("n") => Some(Message::NewFile),
                     keyboard::Key::Character("w") => Some(Message::CloseActiveTab),
+                    keyboard::Key::Character("g") => Some(Message::GoToPrompt),
+                    keyboard::Key::Character("p" | "P") => Some(Message::PaletteOpen),
                     _ => None,
                 },
                 iced::Event::Keyboard(keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(keyboard::key::Named::Escape),
-                    ..
-                }) => Some(Message::CloseContext),
+                    key: keyboard::Key::Named(named), ..
+                }) => match named {
+                    // Escape closes whatever overlay is up; the arrows only
+                    // do anything while the palette is open (see update()).
+                    keyboard::key::Named::Escape => Some(Message::CloseContext),
+                    keyboard::key::Named::ArrowUp => Some(Message::PaletteNav(-1)),
+                    keyboard::key::Named::ArrowDown => Some(Message::PaletteNav(1)),
+                    _ => None,
+                },
                 _ => None,
             }),
         ])
@@ -452,6 +541,26 @@ impl Skyde {
                     self.active = Some(i);
                     return Task::none();
                 }
+                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                if size > BIG_FILE_BYTES {
+                    // Streaming piece-table mode: the editor shows content as
+                    // it arrives instead of blocking on the whole file.
+                    self.open.push(Buffer {
+                        syntax: syntax_for(&path),
+                        content: text_editor::Content::new(),
+                        dirty: false,
+                        path: Some(path.clone()),
+                        scroll: 0.0,
+                        highlight: false,
+                        big: Some(big::BigBuffer::new(size)),
+                    });
+                    self.active = Some(self.open.len() - 1);
+                    self.status = format!("streaming {} ({} MB)…", path.display(), size / (1024 * 1024));
+                    let stream_path = path.clone();
+                    return Task::run(read_stream(path), move |ev| {
+                        Message::BigLoad(stream_path.clone(), ev)
+                    });
+                }
                 match std::fs::read_to_string(&path) {
                     Ok(src) => {
                         self.open.push(Buffer {
@@ -460,6 +569,8 @@ impl Skyde {
                             dirty: false,
                             path: Some(path),
                             scroll: 0.0,
+                            highlight: size <= HIGHLIGHT_MAX_BYTES,
+                            big: None,
                         });
                         self.active = Some(self.open.len() - 1);
                         self.status = "opened".into();
@@ -500,13 +611,23 @@ impl Skyde {
             Message::Save => {
                 if let Some(buf) = self.active.and_then(|i| self.open.get_mut(i)) {
                     match &buf.path {
-                        Some(p) => match std::fs::write(p, buf.content.text()) {
-                            Ok(()) => {
-                                buf.dirty = false;
-                                self.status = format!("saved {}", p.display());
+                        Some(p) => {
+                            let result = match &buf.big {
+                                Some(big) => std::fs::File::create(p).and_then(|f| {
+                                    let mut w = std::io::BufWriter::new(f);
+                                    big.table.write_to(&mut w)?;
+                                    std::io::Write::flush(&mut w)
+                                }),
+                                None => std::fs::write(p, buf.content.text()),
+                            };
+                            match result {
+                                Ok(()) => {
+                                    buf.dirty = false;
+                                    self.status = format!("saved {}", p.display());
+                                }
+                                Err(e) => self.status = format!("save failed: {e}"),
                             }
-                            Err(e) => self.status = format!("save failed: {e}"),
-                        },
+                        }
                         None => {
                             self.status = "untitled buffer: save-as not implemented yet".into();
                         }
@@ -643,13 +764,26 @@ impl Skyde {
                 self.console = None;
             }
             Message::Menu(name) => {
-                if name == "File" {
-                    self.context = match self.context.take() {
-                        Some((_, CtxKind::FileMenu)) => None,
-                        _ => Some((self.cursor, CtxKind::FileMenu)),
-                    };
-                } else {
-                    self.status = format!("{name} menu: not implemented yet");
+                let kind = match name {
+                    "File" => Some(CtxKind::FileMenu),
+                    "Edit" => Some(CtxKind::EditMenu),
+                    "Go" => Some(CtxKind::GoMenu),
+                    _ => None,
+                };
+                match kind {
+                    Some(kind) => {
+                        self.context = match self.context.take() {
+                            // Same menu clicked again: toggle it closed.
+                            Some((_, open))
+                                if std::mem::discriminant(&open)
+                                    == std::mem::discriminant(&kind) =>
+                            {
+                                None
+                            }
+                            _ => Some((self.cursor, kind)),
+                        };
+                    }
+                    None => self.status = format!("{name} menu: not implemented yet"),
                 }
             }
             Message::ChangeView(mode) => {
@@ -696,7 +830,12 @@ impl Skyde {
                     CtxKind::Package(_)
                     | CtxKind::NewEntry { .. }
                     | CtxKind::FileMenu
-                    | CtxKind::Workspace { .. } => {}
+                    | CtxKind::EditMenu
+                    | CtxKind::GoMenu
+                    | CtxKind::Workspace { .. }
+                    | CtxKind::Recents
+                    | CtxKind::TemplateAdd
+                    | CtxKind::GoTo => {}
                 }
                 self.context = Some((self.cursor, kind));
             }
@@ -706,6 +845,7 @@ impl Skyde {
             }
             Message::CloseContext => {
                 self.context = None;
+                self.palette = None;
             }
             Message::NewTargetIn(dir) => {
                 self.selected = Some(dir);
@@ -833,11 +973,179 @@ impl Skyde {
                             self.status = format!("folder created; buck2 init failed: {e}");
                         }
                     }
+                    // Scaffold the picked template into the fresh workspace
+                    // ("I want a rust project", goal.md #2).
+                    if let Some(tname) = self.new_ws_template.clone() {
+                        match self.scaffold_workspace(&path, &tname) {
+                            Ok(what) => self.status = format!("{} · scaffolded {what}", self.status),
+                            Err(e) => self.status = format!("{} · scaffold failed: {e}", self.status),
+                        }
+                    }
                 } else if !path.is_dir() {
                     self.status = format!("{} is not a folder", path.display());
                     return Task::none();
                 }
                 return self.switch_root(path);
+            }
+            Message::WorkspaceTemplate(name) => {
+                self.new_ws_template = Some(name);
+                // Keep the dialog (and its focused path input) open.
+                return iced::widget::operation::focus(NEW_ENTRY_INPUT);
+            }
+            Message::RecentsShow => {
+                self.recents = recent::load();
+                self.context = Some((self.cursor, CtxKind::Recents));
+            }
+            Message::RecentOpen(path) => {
+                if !path.is_dir() {
+                    self.status = format!("{} is gone", path.display());
+                    return Task::none();
+                }
+                return self.switch_root(path);
+            }
+            Message::TemplateAddPrompt => {
+                self.new_entry.clear();
+                self.context = Some((self.cursor, CtxKind::TemplateAdd));
+                return iced::widget::operation::focus(NEW_ENTRY_INPUT);
+            }
+            Message::TemplateAddRun => {
+                self.context = None;
+                let spec = self.new_entry.trim().to_owned();
+                if spec.is_empty() {
+                    return Task::none();
+                }
+                self.status = format!("installing template from {spec}…");
+                return Task::perform(
+                    async move { install_template(&spec) },
+                    Message::TemplateInstalled,
+                );
+            }
+            Message::TemplateInstalled(result) => {
+                match result {
+                    Ok(msg) => {
+                        self.templates = load_templates(&self.root);
+                        self.index = ske::index::scan(&self.root, &self.templates);
+                        self.status = msg;
+                    }
+                    Err(e) => self.status = format!("template install failed: {e}"),
+                }
+            }
+            Message::GoToPrompt => {
+                if self.active.is_none() {
+                    self.status = "no open file to go to a line in".into();
+                    return Task::none();
+                }
+                self.new_entry.clear();
+                self.context = Some((self.cursor, CtxKind::GoTo));
+                return iced::widget::operation::focus(NEW_ENTRY_INPUT);
+            }
+            Message::GoToLine => {
+                self.context = None;
+                let Ok(n) = self.new_entry.trim().parse::<usize>() else {
+                    self.status = "go to line: give a line number".into();
+                    return Task::none();
+                };
+                let view_h = self.editor_text_h.get();
+                if let Some(buf) = self.active.and_then(|i| self.open.get_mut(i)) {
+                    let line = n.saturating_sub(1);
+                    if let Some(big) = &mut buf.big {
+                        big.line = line.min(big.table.line_count().saturating_sub(1));
+                        big.col = 0;
+                        big.clamp_scroll(view_h);
+                        big.ensure_cursor_visible(view_h);
+                    } else {
+                        let line = line.min(buf.content.line_count().saturating_sub(1));
+                        buf.content
+                            .perform(text_editor::Action::Move(text_editor::Motion::DocumentStart));
+                        for _ in 0..line {
+                            buf.content
+                                .perform(text_editor::Action::Move(text_editor::Motion::Down));
+                        }
+                        let max =
+                            (buf.content.line_count() as f32 * gutter::LINE_H - view_h).max(0.0);
+                        buf.scroll = buf.scroll.clamp(0.0, max);
+                        ensure_cursor_visible(buf, view_h);
+                    }
+                    self.status = format!("line {n}");
+                }
+            }
+            Message::PaletteOpen => {
+                self.context = None;
+                self.palette = Some(Palette {
+                    input: String::new(),
+                    index: 0,
+                    files: workspace_files(&self.root, 3000),
+                });
+                return iced::widget::operation::focus(PALETTE_INPUT);
+            }
+            Message::PaletteInput(s) => {
+                if let Some(p) = &mut self.palette {
+                    p.input = s;
+                    p.index = 0;
+                }
+            }
+            Message::PaletteNav(dir) => {
+                let count = self
+                    .palette
+                    .as_ref()
+                    .map(|p| self.palette_matches(p).len())
+                    .unwrap_or(0);
+                if let Some(p) = &mut self.palette {
+                    if count > 0 {
+                        let i = p.index as i32 + dir;
+                        p.index = i.rem_euclid(count.min(PALETTE_ROWS) as i32) as usize;
+                    }
+                }
+            }
+            Message::PaletteRun(pick) => {
+                let Some(p) = self.palette.take() else {
+                    return Task::none();
+                };
+                let matches = self.palette_matches(&p);
+                let chosen = pick.unwrap_or(p.index);
+                if let Some((_, msg)) = matches.into_iter().nth(chosen) {
+                    return self.update(msg);
+                }
+            }
+            Message::Big(action) => {
+                let view_h = self.editor_text_h.get();
+                let cols = self.editor_cols.get();
+                if let Some(buf) = self.active.and_then(|i| self.open.get_mut(i)) {
+                    if let Some(big) = &mut buf.big {
+                        if big.apply(action, view_h) {
+                            buf.dirty = true;
+                        }
+                        big.follow_cursor_h(cols);
+                    }
+                }
+            }
+            Message::BigLoad(path, ev) => {
+                let Some(buf) = self
+                    .open
+                    .iter_mut()
+                    .find(|b| b.path.as_deref() == Some(path.as_path()) && b.big.is_some())
+                else {
+                    return Task::none();
+                };
+                let big = buf.big.as_mut().expect("checked above");
+                match ev {
+                    big::Load::Chunk(chunk) => {
+                        big.loaded_bytes += chunk.len() as u64;
+                        big.table.push_chunk(chunk);
+                    }
+                    big::Load::Done => {
+                        big.loading = false;
+                        self.status = format!(
+                            "{} loaded ({} lines)",
+                            path.display(),
+                            big.table.line_count()
+                        );
+                    }
+                    big::Load::Failed(e) => {
+                        big.loading = false;
+                        self.status = format!("read failed: {e}");
+                    }
+                }
             }
         }
         Task::none()
@@ -846,6 +1154,8 @@ impl Skyde {
     /// Point the whole app at a different workspace root.
     fn switch_root(&mut self, root: PathBuf) -> Task<Message> {
         self.root = root;
+        recent::touch(&self.root);
+        self.new_ws_template = None;
         self.tree = tree::read_dir(&self.root);
         self.buck_root = ske::buck::find_root(&self.root);
         self.templates = load_templates(&self.root);
@@ -860,6 +1170,82 @@ impl Skyde {
             Some(r) => load_targets(r),
             None => Task::none(),
         }
+    }
+
+    /// Copy a template's scaffold into a fresh workspace root, substituting
+    /// `{{name}}`/`{{package}}`. Prefers a binary rule's scaffold.
+    fn scaffold_workspace(&self, dest: &Path, template_name: &str) -> Result<String, String> {
+        let (manifest, mpath) = self
+            .templates
+            .manifests
+            .iter()
+            .find(|(m, _)| m.template.name == template_name)
+            .ok_or_else(|| format!("template '{template_name}' not loaded"))?;
+        let mut rules: Vec<&ske::template::Rule> = manifest
+            .lark
+            .rules
+            .iter()
+            .filter(|r| r.scaffold.is_some())
+            .collect();
+        rules.sort_by_key(|r| r.kind != ske::template::RuleKind::Binary);
+        let rule = rules
+            .first()
+            .ok_or_else(|| format!("template '{template_name}' has no scaffold"))?;
+        let scaffold = mpath
+            .parent()
+            .ok_or("template manifest has no parent dir")?
+            .join("scaffold")
+            .join(rule.scaffold.as_deref().unwrap_or_default());
+        let name = dest
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "project".into());
+        copy_scaffold(&scaffold, dest, &name, "//")
+            .map_err(|e| format!("{}: {e}", scaffold.display()))?;
+        Ok(format!("{} ({template_name} {})", name, rule.call))
+    }
+
+    /// Palette entries (label, message) matching the current input, best
+    /// first. Rebuilt on demand — the lists are small.
+    fn palette_matches(&self, p: &Palette) -> Vec<(String, Message)> {
+        let mut entries: Vec<(String, Message)> = vec![
+            ("save file  ·  ctrl+s".into(), Message::Save),
+            ("new file  ·  ctrl+n".into(), Message::NewFile),
+            ("close tab  ·  ctrl+w".into(), Message::CloseActiveTab),
+            ("go to line…  ·  ctrl+g".into(), Message::GoToPrompt),
+            ("view: files".into(), Message::ChangeView(ViewMode::Files)),
+            ("view: build graph".into(), Message::ChangeView(ViewMode::Targets)),
+            ("build //...".into(), Message::BuildTarget("//...".into())),
+            ("refresh tree + targets".into(), Message::RefreshTree),
+            ("new workspace…".into(), Message::WorkspacePrompt { create: true }),
+            ("open workspace…".into(), Message::WorkspacePrompt { create: false }),
+            ("recent workspaces…".into(), Message::RecentsShow),
+            ("add template…".into(), Message::TemplateAddPrompt),
+        ];
+        for t in self.all_targets() {
+            entries.push((format!("build {}", t.label), Message::BuildTarget(t.label.clone())));
+        }
+        for f in &p.files {
+            let rel = f.strip_prefix(&self.root).unwrap_or(f);
+            entries.push((format!("open {}", rel.display()), Message::Open(f.clone())));
+        }
+        let needle = p.input.trim().to_lowercase();
+        if needle.is_empty() {
+            entries.truncate(PALETTE_ROWS);
+            return entries;
+        }
+        let mut scored: Vec<(u32, String, Message)> = entries
+            .into_iter()
+            .filter_map(|(label, msg)| {
+                fuzzy_score(&label.to_lowercase(), &needle).map(|s| (s, label, msg))
+            })
+            .collect();
+        scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.len().cmp(&b.1.len())));
+        scored
+            .into_iter()
+            .take(PALETTE_ROWS)
+            .map(|(_, l, m)| (l, m))
+            .collect()
     }
 
     /// Add the currently selected file to `label` — under `attr` if given,
@@ -974,6 +1360,13 @@ impl Skyde {
                     .on_right_press(Message::CloseContext),
             );
             layers = layers.push(self.context_menu(*at, kind));
+        }
+        if let Some(p) = &self.palette {
+            layers = layers.push(
+                mouse_area(Space::new().width(Fill).height(Fill))
+                    .on_press(Message::CloseContext),
+            );
+            layers = layers.push(self.palette_view(p));
         }
         if !self.maximized {
             for grip in resize_grips() {
@@ -1157,6 +1550,86 @@ impl Skyde {
                     Message::WorkspacePrompt { create: false },
                 ));
             }
+            CtxKind::EditMenu => {
+                items.push(item("command palette… (ctrl+p)".into(), Message::PaletteOpen));
+                items.push(item("recent workspaces…".into(), Message::RecentsShow));
+                items.push(item("add template…".into(), Message::TemplateAddPrompt));
+            }
+            CtxKind::GoMenu => {
+                items.push(item("go to line… (ctrl+g)".into(), Message::GoToPrompt));
+            }
+            CtxKind::Recents => {
+                items.push(
+                    container(text("recent workspaces").size(11).color(MUTED))
+                        .padding([2, 6])
+                        .into(),
+                );
+                if self.recents.is_empty() {
+                    items.push(
+                        container(text("nothing here yet").size(12).color(MUTED))
+                            .padding([4, 6])
+                            .into(),
+                    );
+                }
+                for e in self.recents.iter().take(10) {
+                    let row = column![
+                        row![
+                            text(e.name.clone()).size(12).color(TEXT),
+                            space::horizontal(),
+                            text(recent::ago(e.epoch)).size(11).color(MUTED)
+                        ]
+                        .align_y(Alignment::Center),
+                        text(e.path.display().to_string()).size(11).color(MUTED)
+                    ]
+                    .spacing(1);
+                    items.push(
+                        button(row)
+                            .on_press(Message::CtxAction(Box::new(Message::RecentOpen(
+                                e.path.clone(),
+                            ))))
+                            .width(Fill)
+                            .padding([5, 10])
+                            .style(menu_button)
+                            .into(),
+                    );
+                }
+            }
+            CtxKind::TemplateAdd => {
+                items.push(
+                    container(
+                        text("add template from a path, http(s) url,\ngithub:user/repo or git url:")
+                            .size(11)
+                            .color(MUTED),
+                    )
+                    .padding([2, 6])
+                    .into(),
+                );
+                items.push(
+                    text_input("~/templates/zig  ·  github:user/repo", &self.new_entry)
+                        .id(NEW_ENTRY_INPUT)
+                        .on_input(Message::NewEntryName)
+                        .on_submit(Message::TemplateAddRun)
+                        .size(12)
+                        .padding([4, 8])
+                        .into(),
+                );
+            }
+            CtxKind::GoTo => {
+                items.push(
+                    container(text("go to line:").size(11).color(MUTED))
+                        .padding([2, 6])
+                        .into(),
+                );
+                items.push(
+                    text_input("42", &self.new_entry)
+                        .id(NEW_ENTRY_INPUT)
+                        .on_input(Message::NewEntryName)
+                        .on_submit(Message::GoToLine)
+                        .size(12)
+                        .padding([4, 8])
+                        .into(),
+                );
+            }
             CtxKind::Workspace { create } => {
                 items.push(
                     container(
@@ -1180,11 +1653,47 @@ impl Skyde {
                         .padding([4, 8])
                         .into(),
                 );
+                if *create {
+                    // Template to scaffold from: "I want a rust project."
+                    let names: Vec<String> = self
+                        .templates
+                        .manifests
+                        .iter()
+                        .filter(|(m, _)| m.lark.rules.iter().any(|r| r.scaffold.is_some()))
+                        .map(|(m, _)| m.template.name.clone())
+                        .collect();
+                    if !names.is_empty() {
+                        items.push(
+                            container(text("base it on a template:").size(11).color(MUTED))
+                                .padding([2, 6])
+                                .into(),
+                        );
+                        items.push(
+                            pick_list(
+                                names,
+                                self.new_ws_template.clone(),
+                                Message::WorkspaceTemplate,
+                            )
+                            .placeholder("empty workspace")
+                            .text_size(12)
+                            .padding([4, 8])
+                            .width(Fill)
+                            .into(),
+                        );
+                    }
+                    items.push(
+                        button(text("create").size(12).color(ACCENT))
+                            .on_press(Message::CtxAction(Box::new(Message::WorkspaceSet)))
+                            .padding([5, 10])
+                            .style(menu_button)
+                            .into(),
+                    );
+                }
             }
         }
         let width = match kind {
             // Paths need room.
-            CtxKind::Workspace { .. } => 340.0,
+            CtxKind::Workspace { .. } | CtxKind::Recents | CtxKind::TemplateAdd => 340.0,
             _ => 200.0,
         };
         container(
@@ -1197,6 +1706,74 @@ impl Skyde {
             left: at.x,
             right: 0.0,
             bottom: 0.0,
+        })
+        .into()
+    }
+
+    /// Command palette: centered near the top, input + best matches
+    /// (mockup 02_command_pallet.html).
+    fn palette_view(&self, p: &Palette) -> Element<'_, Message> {
+        let matches = self.palette_matches(p);
+        let mut items: Vec<Element<'_, Message>> = vec![
+            text_input("type a command or file name…", &p.input)
+                .id(PALETTE_INPUT)
+                .on_input(Message::PaletteInput)
+                .on_submit(Message::PaletteRun(None))
+                .size(13)
+                .padding([7, 10])
+                .into(),
+        ];
+        for (i, (label, _)) in matches.iter().enumerate() {
+            let selected = i == p.index;
+            items.push(
+                button(
+                    text(label.clone())
+                        .size(12)
+                        .color(if selected { TEXT } else { TEXT_DIM })
+                        .wrapping(Wrapping::None),
+                )
+                .on_press(Message::PaletteRun(Some(i)))
+                .width(Fill)
+                .padding([5, 10])
+                .style(move |_t: &Theme, status| {
+                    let hovered =
+                        matches!(status, button::Status::Hovered | button::Status::Pressed);
+                    button::Style {
+                        background: if selected {
+                            Some(Background::Color(ACCENT_BG))
+                        } else if hovered {
+                            Some(Background::Color(tint(TEXT, 0.05)))
+                        } else {
+                            None
+                        },
+                        text_color: TEXT_DIM,
+                        border: Border {
+                            radius: border::radius(4),
+                            ..Border::default()
+                        },
+                        ..button::Style::default()
+                    }
+                })
+                .into(),
+            );
+        }
+        if matches.is_empty() {
+            items.push(
+                container(text("no matches").size(12).color(MUTED))
+                    .padding([5, 10])
+                    .into(),
+            );
+        }
+        container(
+            container(column(items).spacing(2).width(Length::Fixed(560.0)))
+                .padding(6)
+                .style(context_panel),
+        )
+        .align_x(iced::alignment::Horizontal::Center)
+        .width(Fill)
+        .padding(iced::Padding {
+            top: 60.0,
+            ..iced::Padding::ZERO
         })
         .into()
     }
@@ -1966,6 +2543,45 @@ impl Skyde {
         .width(Fill)
         .style(tabstrip_bg);
 
+        // Super-large files: canvas-rendered piece table, no highlighting,
+        // just line numbers and plain edits (goal.md #7).
+        if let Some(big) = &buf.big {
+            let body = responsive(move |size| {
+                self.editor_text_h.set(size.height);
+                let line_count = big.table.line_count();
+                let digits = line_count.to_string().len().max(2);
+                let gutter_w = digits as f32 * 8.0 + 20.0;
+                self.editor_cols
+                    .set(((size.width - gutter_w - 12.0) / big::CHAR_W).max(10.0) as usize);
+                let first = (big.scroll / gutter::LINE_H) as usize;
+                let visible = (size.height / gutter::LINE_H).ceil() as usize + 1;
+                let lines: Vec<String> = (first..(first + visible).min(line_count))
+                    .map(|i| big.table.line(i))
+                    .collect();
+                canvas(big::View {
+                    lines,
+                    first,
+                    scroll: big.scroll,
+                    cursor: (big.line, big.col),
+                    h_first: big.h_first,
+                    gutter_w,
+                    loading: big
+                        .loading
+                        .then(|| big.loaded_bytes as f32 / big.total_bytes.max(1) as f32),
+                    focused_input: self.context.is_some() || self.palette.is_some(),
+                })
+                .width(Fill)
+                .height(Fill)
+                .into()
+            });
+            return container(column![header, rule::horizontal(1), body].height(Fill))
+                .width(Fill)
+                .height(Fill)
+                .clip(true)
+                .style(editor_panel)
+                .into();
+        }
+
         // Gutter is a canvas that mirrors the editor's scroll offset; size and
         // line height are pinned to the same values on both so rows line up.
         let line_count = buf.content.line_count().max(1);
@@ -1973,6 +2589,26 @@ impl Skyde {
         let gutter_w = digits as f32 * 8.0 + 20.0;
         let cursor_line = buf.content.cursor().position.line;
         let scroll = buf.scroll;
+
+        // Auto-indent (goal.md #9): pressing Enter copies the current line's
+        // leading whitespace, plus one level after an opening brace/colon.
+        let indent: String = {
+            let cur = buf.content.cursor().position;
+            let line = buf
+                .content
+                .line(cur.line)
+                .map(|l| l.text.to_string())
+                .unwrap_or_default();
+            let before: String = line.chars().take(cur.column).collect();
+            let mut indent: String = before
+                .chars()
+                .take_while(|c| *c == ' ' || *c == '\t')
+                .collect();
+            if matches!(before.trim_end().chars().last(), Some('{' | '(' | '[' | ':')) {
+                indent.push_str("    ");
+            }
+            indent
+        };
 
         let body = responsive(move |size| {
             // The scroll clamp in update() needs the real text-area height
@@ -1985,14 +2621,25 @@ impl Skyde {
             })
             .width(gutter_w)
             .height(Fill);
+            let indent = indent.clone();
             let editor = text_editor(&buf.content)
                 .placeholder("start typing")
                 .on_action(Message::Edit)
                 // Tab inserts four spaces; the default binding drops it.
-                .key_binding(|kp| match kp.key.as_ref() {
+                // Enter re-applies the current indentation.
+                .key_binding(move |kp| match kp.key.as_ref() {
                     keyboard::Key::Named(keyboard::key::Named::Tab) => {
                         Some(text_editor::Binding::Sequence(
                             (0..4).map(|_| text_editor::Binding::Insert(' ')).collect(),
+                        ))
+                    }
+                    keyboard::Key::Named(keyboard::key::Named::Enter)
+                        if kp.modifiers.is_empty() && !indent.is_empty() =>
+                    {
+                        Some(text_editor::Binding::Sequence(
+                            std::iter::once(text_editor::Binding::Enter)
+                                .chain(indent.chars().map(text_editor::Binding::Insert))
+                                .collect(),
                         ))
                     }
                     _ => text_editor::Binding::from_key_press(kp),
@@ -2001,10 +2648,18 @@ impl Skyde {
                 .size(gutter::TEXT_SIZE)
                 .line_height(LineHeight::Absolute(gutter::LINE_H.into()))
                 .wrapping(Wrapping::None)
-                .highlight(&buf.syntax, highlighter::Theme::Base16Eighties)
                 .padding([8, 12])
                 .style(flat_editor)
                 .height(Fill);
+            // Syntect on megabytes of text is what made big files crawl —
+            // skip it past HIGHLIGHT_MAX_BYTES (goal.md #5).
+            let editor: Element<'_, Message> = if buf.highlight {
+                editor
+                    .highlight(&buf.syntax, highlighter::Theme::Base16Eighties)
+                    .into()
+            } else {
+                editor.into()
+            };
             row![container(numbers).padding([8, 0]).height(Fill), editor]
                 .height(Fill)
                 .into()
@@ -2021,8 +2676,13 @@ impl Skyde {
     fn status_bar(&self) -> Element<'_, Message> {
         let right: Element<'_, Message> = match self.active.and_then(|i| self.open.get(i)) {
             Some(buf) => {
-                let cursor = buf.content.cursor();
-                let (line, col) = (cursor.position.line, cursor.position.column);
+                let (line, col) = match &buf.big {
+                    Some(big) => (big.line, big.col),
+                    None => {
+                        let cursor = buf.content.cursor();
+                        (cursor.position.line, cursor.position.column)
+                    }
+                };
                 text(format!(
                     "Ln {}, Col {}   {}",
                     line + 1,
@@ -2176,13 +2836,325 @@ fn load_targets(root: PathBuf) -> Task<Message> {
 }
 
 /// Template search path: workspace-local overrides first, then the repo's own
-/// templates/, then the user-wide install dir (docs/02-template-system.md).
+/// templates/, then the shared per-user dir (docs/02-template-system.md;
+/// goal.md #1 moved the user dir to the platform data dir, e.g.
+/// `~/.local/share/skyde/templates`).
 fn load_templates(root: &Path) -> ske::template::TemplateSet {
-    let mut roots = vec![root.join(".skedit/templates"), root.join("templates")];
-    if let Some(home) = std::env::var_os("HOME") {
-        roots.push(PathBuf::from(home).join(".config/skedit/templates"));
+    ske::template::TemplateSet::load(&[
+        root.join(".skedit/templates"),
+        root.join("templates"),
+        ske::dirs::templates_dir(),
+    ])
+}
+
+/// First-run setup of the per-user templates dir: migrate the old
+/// `~/.config/skedit/templates` location if it exists, otherwise seed the
+/// built-in rust/cc templates so a fresh install can scaffold projects.
+fn seed_user_templates() {
+    let dest = ske::dirs::templates_dir();
+    if dest.exists() {
+        return;
     }
-    ske::template::TemplateSet::load(&roots)
+    if let Some(home) = std::env::var_os("HOME") {
+        let old = PathBuf::from(home).join(".config/skedit/templates");
+        if old.is_dir() {
+            let _ = std::fs::create_dir_all(dest.parent().unwrap_or(Path::new(".")));
+            if std::fs::rename(&old, &dest).is_ok() {
+                return;
+            }
+        }
+    }
+    // Built-ins baked into the binary, so new machines get rust + cc.
+    let files: [(&str, &str); 6] = [
+        (
+            "rust/rust.skedit.toml",
+            include_str!("../../../templates/rust/rust.skedit.toml"),
+        ),
+        (
+            "rust/scaffold/binary/BUCK.tmpl",
+            include_str!("../../../templates/rust/scaffold/binary/BUCK.tmpl"),
+        ),
+        (
+            "rust/scaffold/binary/src/main.rs.tmpl",
+            include_str!("../../../templates/rust/scaffold/binary/src/main.rs.tmpl"),
+        ),
+        (
+            "rust/scaffold/library/BUCK.tmpl",
+            include_str!("../../../templates/rust/scaffold/library/BUCK.tmpl"),
+        ),
+        (
+            "rust/scaffold/library/src/lib.rs.tmpl",
+            include_str!("../../../templates/rust/scaffold/library/src/lib.rs.tmpl"),
+        ),
+        (
+            "cc/cc.skedit.toml",
+            include_str!("../../../templates/cc/cc.skedit.toml"),
+        ),
+    ];
+    for (rel, content) in files {
+        let path = dest.join(rel);
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(path, content);
+    }
+}
+
+/// Install a template into the per-user dir from a local path, an http(s)
+/// url, `github:user/repo[@ref]`, or any git url (goal.md #4).
+fn install_template(spec: &str) -> Result<String, String> {
+    let dest_root = ske::dirs::templates_dir();
+    std::fs::create_dir_all(&dest_root).map_err(|e| format!("cannot create templates dir: {e}"))?;
+
+    let name_from = |s: &str| {
+        s.trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or("template")
+            .trim_end_matches(".git")
+            .trim_start_matches("skedit-")
+            .to_string()
+    };
+
+    let dest;
+    if let Some(repo) = spec.strip_prefix("github:") {
+        let (repo, git_ref) = match repo.split_once('@') {
+            Some((r, g)) => (r, Some(g)),
+            None => (repo, None),
+        };
+        dest = dest_root.join(name_from(repo));
+        git_clone(&format!("https://github.com/{repo}.git"), git_ref, &dest)?;
+    } else if spec.starts_with("http://") || spec.starts_with("https://") || spec.starts_with("git@")
+    {
+        dest = dest_root.join(name_from(spec));
+        git_clone(spec, None, &dest)?;
+    } else {
+        // Local path: a template directory or a bare *.skedit.toml file.
+        let path = match spec.strip_prefix("~/") {
+            Some(rest) => std::env::var_os("HOME")
+                .map(|h| PathBuf::from(h).join(rest))
+                .unwrap_or_else(|| PathBuf::from(spec)),
+            None => PathBuf::from(spec),
+        };
+        if path.is_dir() {
+            dest = dest_root.join(name_from(&path.to_string_lossy()));
+            copy_dir(&path, &dest).map_err(|e| format!("copy failed: {e}"))?;
+        } else if path.is_file() {
+            let stem = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("template")
+                .trim_end_matches(".skedit.toml")
+                .to_string();
+            dest = dest_root.join(&stem);
+            std::fs::create_dir_all(&dest).map_err(|e| format!("{e}"))?;
+            std::fs::copy(&path, dest.join(path.file_name().unwrap()))
+                .map_err(|e| format!("copy failed: {e}"))?;
+        } else {
+            return Err(format!("{} does not exist", path.display()));
+        }
+    }
+
+    let set = ske::template::TemplateSet::load(std::slice::from_ref(&dest));
+    if set.is_empty() {
+        return Err(format!(
+            "installed to {}, but no *.skedit.toml manifest found there",
+            dest.display()
+        ));
+    }
+    Ok(format!(
+        "installed template(s): {}",
+        set.manifests
+            .iter()
+            .map(|(m, _)| m.template.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
+fn git_clone(url: &str, git_ref: Option<&str>, dest: &Path) -> Result<(), String> {
+    if dest.exists() {
+        return Err(format!("{} already exists", dest.display()));
+    }
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(["clone", "--depth", "1"]);
+    if let Some(r) = git_ref {
+        cmd.args(["--branch", r]);
+    }
+    let out = cmd
+        .arg(url)
+        .arg(dest)
+        .output()
+        .map_err(|e| format!("failed to run git: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let dest = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            // Skip VCS noise when copying a checked-out template.
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            copy_dir(&entry.path(), &dest)?;
+        } else {
+            std::fs::copy(entry.path(), dest)?;
+        }
+    }
+    Ok(())
+}
+
+/// Copy a scaffold directory into `dest`; `*.tmpl` files get `{{name}}` /
+/// `{{package}}` substituted and lose the suffix, everything else is copied.
+fn copy_scaffold(scaffold: &Path, dest: &Path, name: &str, package: &str) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(scaffold)? {
+        let entry = entry?;
+        let fname = entry.file_name().to_string_lossy().into_owned();
+        if entry.file_type()?.is_dir() {
+            copy_scaffold(&entry.path(), &dest.join(&fname), name, package)?;
+            continue;
+        }
+        std::fs::create_dir_all(dest)?;
+        match fname.strip_suffix(".tmpl") {
+            Some(out_name) => {
+                let text = std::fs::read_to_string(entry.path())?;
+                std::fs::write(
+                    dest.join(out_name),
+                    ske::template::substitute(&text, name, package),
+                )?;
+            }
+            None => {
+                std::fs::copy(entry.path(), dest.join(&fname))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// How many rows the command palette shows.
+const PALETTE_ROWS: usize = 12;
+
+/// Subsequence match: lower score is better. Exact-prefix beats substring
+/// beats scattered subsequence; None means no match.
+fn fuzzy_score(haystack: &str, needle: &str) -> Option<u32> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    if let Some(pos) = haystack.find(needle) {
+        return Some(if pos == 0 { 0 } else { 1000 + pos as u32 });
+    }
+    // Scattered subsequence: penalize by total gap size.
+    let mut score = 100_000u32;
+    let mut it = haystack.chars();
+    for nc in needle.chars() {
+        let mut gap = 0u32;
+        loop {
+            let hc = it.next()?;
+            if hc == nc {
+                break;
+            }
+            gap += 1;
+        }
+        score += gap;
+    }
+    Some(score)
+}
+
+/// Files for the palette: workspace-relative, skipping VCS/build dirs.
+fn workspace_files(root: &Path, cap: usize) -> Vec<PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>, cap: usize) {
+        if out.len() >= cap {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            if out.len() >= cap {
+                return;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') || name == "target" || name == "buck-out" {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out, cap);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, &mut out, cap);
+    out
+}
+
+/// Stream a big file off a reader thread in ~4 MB chunks, split at UTF-8
+/// boundaries (goal.md #7: super large files are streamed in).
+fn read_stream(path: PathBuf) -> impl iced::futures::Stream<Item = big::Load> {
+    use iced::futures::SinkExt;
+    use iced::futures::channel::mpsc::Sender;
+
+    iced::stream::channel(4, async move |mut out: Sender<big::Load>| {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let send = |out: &mut Sender<big::Load>, ev| {
+                iced::futures::executor::block_on(out.send(ev)).is_ok()
+            };
+            let mut file = match std::fs::File::open(&path) {
+                Ok(f) => f,
+                Err(e) => {
+                    send(&mut out, big::Load::Failed(e.to_string()));
+                    return;
+                }
+            };
+            let mut carry: Vec<u8> = Vec::new();
+            let mut buf = vec![0u8; 4 * 1024 * 1024];
+            loop {
+                let n = match file.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) => {
+                        send(&mut out, big::Load::Failed(e.to_string()));
+                        return;
+                    }
+                };
+                carry.extend_from_slice(&buf[..n]);
+                // Cut at the last UTF-8 boundary; the tail rides along.
+                let valid = match std::str::from_utf8(&carry) {
+                    Ok(_) => carry.len(),
+                    Err(e) => e.valid_up_to(),
+                };
+                if valid > 0 {
+                    let rest = carry.split_off(valid);
+                    let chunk = String::from_utf8(std::mem::replace(&mut carry, rest))
+                        .expect("validated above");
+                    if !send(&mut out, big::Load::Chunk(chunk)) {
+                        return; // buffer was closed; stop reading
+                    }
+                }
+            }
+            if !carry.is_empty() {
+                // Trailing invalid bytes: keep the file openable anyway.
+                send(
+                    &mut out,
+                    big::Load::Chunk(String::from_utf8_lossy(&carry).into_owned()),
+                );
+            }
+            send(&mut out, big::Load::Done);
+        });
+    })
 }
 
 // ---- styles ----
@@ -2412,5 +3384,39 @@ fn close_button(_theme: &Theme, status: button::Status) -> button::Style {
             text_color: MUTED,
             ..button::Style::default()
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fuzzy_prefix_beats_substring_beats_subsequence() {
+        let prefix = fuzzy_score("build //demo:app", "build").unwrap();
+        let substring = fuzzy_score("open build.rs", "build").unwrap();
+        let scattered = fuzzy_score("bacon guild", "build").unwrap();
+        assert!(prefix < substring, "{prefix} {substring}");
+        assert!(substring < scattered, "{substring} {scattered}");
+        assert_eq!(fuzzy_score("nothing here", "xyz"), None);
+    }
+
+    #[test]
+    fn scaffold_copies_and_substitutes() {
+        let tmp = std::env::temp_dir().join(format!("skyde-scaffold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        // Tests run with the crate as cwd, so the repo templates are two up.
+        copy_scaffold(
+            Path::new("../../templates/rust/scaffold/binary"),
+            &tmp,
+            "demo",
+            "//",
+        )
+        .unwrap();
+        let buck = std::fs::read_to_string(tmp.join("BUCK")).unwrap();
+        assert!(buck.contains("name = \"demo\""), "{buck}");
+        assert!(tmp.join("src/main.rs").exists());
+        assert!(!tmp.join("BUCK.tmpl").exists());
+        std::fs::remove_dir_all(&tmp).unwrap();
     }
 }

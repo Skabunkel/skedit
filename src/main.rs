@@ -33,11 +33,7 @@ fn main() -> ExitCode {
 }
 
 fn templates_dir() -> PathBuf {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("skedit/templates")
+    ske::dirs::templates_dir()
 }
 
 fn add(spec: &str, rest: &[&str]) -> Result<(), String> {

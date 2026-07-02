@@ -56,6 +56,17 @@ Each milestone is usable on its own.
 - Window resize grips on all edges/corners (needed since decorations are off). ✅
 - Right-click context menus: tree entries (new target here / open / add to
   selected target), targets (build / open BUCK / delete), packages (new target). ✅
+- goal.md batch (2026-07-03): command palette (ctrl+p, fuzzy commands + files),
+  go-to-line (ctrl+g + Go menu), auto-indent on Enter, recent-workspaces list
+  (`<name> <path> <epoch>` lines in the user dir) under Edit, add-template from
+  path/url/git under Edit, new-workspace dialog with template scaffold. ✅
+- Large files: >512 KB skips syntax highlighting; >4 MB opens in a streamed
+  piece-table editor (`piece.rs` + `big.rs`) — line numbers only, basic edits,
+  save. ✅
+- Per-user data dir via `ske::dirs`: `~/.local/share/skyde` on Linux (XDG),
+  `%APPDATA%\skyde` on Windows, `~/Library/Application Support/skyde` on macOS;
+  templates live in `<data>/templates` (old `~/.config/skedit/templates` is
+  migrated, built-in rust/cc seeded on first run). ✅
 
 ### M1 — Buck2 awareness (read-only) ✅ (2026-07-02)
 - Detect a buck2 workspace (`.buckconfig`); run `buck2 targets //... --json`. ✅ (`ske::buck`)
