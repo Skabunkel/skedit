@@ -1,0 +1,40 @@
+# Reference template: Rust on buck2.
+# Format: docs/02-template-system.md — share a directory like this one as a
+# GitHub repo and install it with `skedit template add github:user/repo` (M2+).
+
+[template]
+name = "rust"
+engine = "buck2"
+version = 1
+
+[toolchain]
+lsp = { cmd = "rust-analyzer" }
+fmt = { cmd = "rustfmt", args = ["--edition", "2024"] }
+
+[lark]
+ident = "name"
+
+[[lark.rule]]
+call = "rust_binary"
+kind = "binary"
+srcs = { attr = "srcs", ext = ["rs"] }
+deps = { attr = "deps" }
+scaffold = "binary"
+
+[[lark.rule]]
+call = "rust_library"
+kind = "library"
+srcs = { attr = "srcs", ext = ["rs"] }
+deps = { attr = "deps" }
+scaffold = "library"
+
+[[lark.rule]]
+call = "rust_test"
+kind = "test"
+srcs = { attr = "srcs", ext = ["rs"] }
+deps = { attr = "deps" }
+
+[lark.load]
+rust_binary = "@prelude//rust:rust_binary.bzl"
+rust_library = "@prelude//rust:rust_library.bzl"
+rust_test = "@prelude//rust:rust_test.bzl"

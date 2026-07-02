@@ -4,7 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+ske = { path = "crates/ske" }
 
 [workspace]
 resolver="3"
-members = ["crates/ske","skedit-cli"]
+members = ["crates/ske", "crates/skyde","skedit-cli"]
+
+# Debug builds: keep our crates fast to compile, but optimize deps —
+# syntect/cosmic-text/wgpu are unusably slow at opt-level 0.
+[profile.dev.package."*"]
+opt-level = 2

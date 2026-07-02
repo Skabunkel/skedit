@@ -1,0 +1,11 @@
+rust_binary(
+    name = "demo",
+    srcs = ["src/main.rs"],
+    deps = [":demolib"],
+)
+
+rust_library(
+    name = "demolib",
+    srcs = ["src/lib.rs"],
+    visibility = ["PUBLIC"],
+)

@@ -1,3 +1,7 @@
+pub mod index;
+pub mod template;
+pub mod buck;
+
 use std::fmt;
 
 use starlark_syntax::codemap::Span;

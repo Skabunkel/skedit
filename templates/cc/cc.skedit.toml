@@ -1,0 +1,32 @@
+# Reference template: C/C++ on buck2.
+# Shows multiple file-carrying attributes: .h/.hpp route to hdrs, not srcs.
+
+[template]
+name = "cc"
+engine = "buck2"
+version = 1
+
+[toolchain]
+lsp = { cmd = "clangd" }
+fmt = { cmd = "clang-format", args = ["-i"] }
+
+[lark]
+ident = "name"
+
+[[lark.rule]]
+call = "cxx_binary"
+kind = "binary"
+srcs = { attr = "srcs", ext = ["cc", "cpp", "c"] }
+hdrs = { attr = "headers", ext = ["h", "hpp"] }
+deps = { attr = "deps" }
+
+[[lark.rule]]
+call = "cxx_library"
+kind = "library"
+srcs = { attr = "srcs", ext = ["cc", "cpp", "c"] }
+hdrs = { attr = "exported_headers", ext = ["h", "hpp"] }
+deps = { attr = "deps" }
+
+[lark.load]
+cxx_binary = "@prelude//cxx:cxx_binary.bzl"
+cxx_library = "@prelude//cxx:cxx_library.bzl"
