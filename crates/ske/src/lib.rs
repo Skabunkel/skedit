@@ -501,6 +501,20 @@ pub fn list_rules(source: &str) -> Result<Vec<RuleEntry>, Error> {
     Ok(entries)
 }
 
+/// 0-based line number where a rule call starts, for editors to jump to.
+pub fn rule_line(source: &str, rule_name: &str, name: &str) -> Result<usize, Error> {
+    let rule = find_rule(
+        source,
+        &RuleSelector {
+            rule_name: rule_name.to_owned(),
+            attr: "name".to_owned(),
+            name: Some(name.to_owned()),
+        },
+    )?;
+    let offset = rule.call_span.begin().get() as usize;
+    Ok(source[..offset.min(source.len())].matches('\n').count())
+}
+
 /// Recursively walk statements to collect all rule calls.
 fn collect_all_rules(
     stmt: &StmtP<AstNoPayload>,
@@ -563,6 +577,14 @@ fn detect_indent_at(source: &str, pos: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rule_line_points_at_the_call() {
+        let src = "rust_binary(\n    name = \"demo\",\n)\n\nrust_library(\n    name = \"demolib\",\n)\n";
+        assert_eq!(rule_line(src, "rust_binary", "demo").unwrap(), 0);
+        assert_eq!(rule_line(src, "rust_library", "demolib").unwrap(), 4);
+        assert!(rule_line(src, "rust_library", "nope").is_err());
+    }
 
     fn selector(rule: &str, attr: &str) -> RuleSelector {
         RuleSelector {

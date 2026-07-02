@@ -2,7 +2,7 @@
 //! link against buck2 internals (docs/01-architecture.md).
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 
 #[derive(Debug, Clone)]
 pub struct Target {
@@ -127,6 +127,19 @@ fn str_list(v: Option<&serde_json::Value>) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Spawn `buck2 build <label>` with piped stdout/stderr so callers can
+/// stream the output line by line. `--console simple` keeps stderr free of
+/// superconsole redraw escapes.
+pub fn build_child(root: &Path, label: &str) -> std::io::Result<Child> {
+    Command::new("buck2")
+        .args(["build", label, "--console", "simple"])
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
 }
 
 /// Run `buck2 build <label>`; returns the combined output either way.

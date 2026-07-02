@@ -1,6 +1,7 @@
 //! Build-graph canvas (docs/00-plan.md M4): targets as nodes, deps as edges,
 //! layered left→right like the project-view mockup.
 
+use iced::advanced::mouse::{Click, click};
 use iced::alignment;
 use iced::mouse;
 use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke, Text};
@@ -69,21 +70,29 @@ impl Program {
 }
 
 impl canvas::Program<Message> for Program {
-    type State = ();
+    /// Last click, so a second one can be recognized as a double click.
+    type State = Option<Click>;
 
     fn update(
         &self,
-        _state: &mut Self::State,
+        state: &mut Self::State,
         event: &canvas::Event,
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Option<canvas::Action<Message>> {
         if let canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event {
             let p = cursor.position_in(bounds)?;
+            let click = Click::new(p, mouse::Button::Left, state.take());
+            *state = Some(click);
             for i in 0..self.nodes.len() {
                 if self.node_rect(i).contains(p) {
                     let ti = self.nodes[i].target_idx?;
-                    return Some(canvas::Action::publish(Message::SelectTarget(ti)));
+                    let msg = if matches!(click.kind(), click::Kind::Double) {
+                        Message::OpenTargetSource(ti)
+                    } else {
+                        Message::SelectTarget(ti)
+                    };
+                    return Some(canvas::Action::publish(msg));
                 }
             }
         }

@@ -7,14 +7,16 @@ use std::path::{Path, PathBuf};
 use iced::border;
 use iced::highlighter;
 use iced::keyboard;
+use iced::mouse;
 use iced::widget::{
     Space, button, canvas, column, container, mouse_area, pick_list, responsive, row, rule,
-    scrollable, space, text, text_editor, text_input,
+    scrollable, space, stack, text, text_editor, text_input,
 };
 use iced::widget::text::{LineHeight, Wrapping};
 use iced::window;
 use iced::{
-    Alignment, Background, Border, Color, Element, Fill, Font, Length, Subscription, Task, Theme,
+    Alignment, Background, Border, Color, Element, Fill, Font, Length, Point, Subscription, Task,
+    Theme,
 };
 
 const NERD_FONT: Font = Font::with_name("MesloLGM Nerd Font Mono");
@@ -113,6 +115,10 @@ struct Skyde {
     // Height of the editor's text area, measured in view() by `responsive` —
     // update() needs it to clamp scroll the same way cosmic-text does.
     editor_text_h: std::cell::Cell<f32>,
+    // Last cursor position in window coordinates, for placing the context
+    // menu. mouse_area's right-press message carries no position.
+    cursor: Point,
+    context: Option<(Point, CtxKind)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,7 +176,7 @@ enum Message {
     DeleteTarget(String),
     AddSelectedFile(String),
     BuildTarget(String),
-    BuildFinished(Result<String, String>),
+    BuildEvent(BuildEvent),
     CloseConsole,
     Menu(&'static str),
     FileAction(FileAction),
@@ -180,6 +186,90 @@ enum Message {
     MinimizeWindow,
     ToggleMaximize,
     CloseWindow,
+    ResizeWindow(window::Direction),
+    MouseMoved(Point),
+    OpenContext(CtxKind),
+    CtxAction(Box<Message>),
+    CloseContext,
+    NewTargetIn(PathBuf),
+    OpenTargetSource(usize),
+}
+
+/// One line / completion event from a streaming `buck2 build`.
+#[derive(Debug, Clone)]
+enum BuildEvent {
+    Line(String),
+    Done(bool),
+}
+
+/// What got right-clicked, for the context menu.
+#[derive(Debug, Clone)]
+enum CtxKind {
+    Entry { path: PathBuf, is_dir: bool },
+    Target(usize),
+    Package(String),
+}
+
+/// Mirror cosmic-text's keep-the-cursor-in-view behaviour so the gutter
+/// tracks jumps the same way the editor does.
+fn ensure_cursor_visible(buf: &mut Buffer, view_h: f32) {
+    let top = buf.content.cursor().position.line as f32 * gutter::LINE_H;
+    if top < buf.scroll {
+        buf.scroll = top;
+    } else if top + gutter::LINE_H > buf.scroll + view_h {
+        buf.scroll = top + gutter::LINE_H - view_h;
+    }
+}
+
+/// Stream `buck2 build` output line by line. Plain reader threads feed the
+/// iced channel; the stream closes once every sender clone is dropped.
+fn build_stream(
+    root: PathBuf,
+    label: String,
+) -> impl iced::futures::Stream<Item = BuildEvent> {
+    use iced::futures::SinkExt;
+    use iced::futures::channel::mpsc::Sender;
+
+    fn pump(
+        reader: impl std::io::Read + Send + 'static,
+        mut tx: Sender<BuildEvent>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(reader)
+                .lines()
+                .map_while(Result::ok)
+            {
+                let _ = iced::futures::executor::block_on(tx.send(BuildEvent::Line(line)));
+            }
+        })
+    }
+
+    iced::stream::channel(100, async move |mut out: Sender<BuildEvent>| {
+        let mut child = match ske::buck::build_child(&root, &label) {
+            Ok(child) => child,
+            Err(e) => {
+                let _ = out
+                    .send(BuildEvent::Line(format!("failed to run buck2: {e}")))
+                    .await;
+                let _ = out.send(BuildEvent::Done(false)).await;
+                return;
+            }
+        };
+        let stdout = child.stdout.take().map(|p| pump(p, out.clone()));
+        let stderr = child.stderr.take().map(|p| pump(p, out.clone()));
+        std::thread::spawn(move || {
+            // Drain both pipes fully before reporting completion.
+            if let Some(h) = stdout {
+                let _ = h.join();
+            }
+            if let Some(h) = stderr {
+                let _ = h.join();
+            }
+            let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+            let _ = iced::futures::executor::block_on(out.send(BuildEvent::Done(ok)));
+        });
+    })
 }
 
 fn syntax_for(path: &Path) -> String {
@@ -264,6 +354,8 @@ impl Skyde {
             console: None,
             building: false,
             editor_text_h: std::cell::Cell::new(600.0),
+            cursor: Point::ORIGIN,
+            context: None,
         };
         // `skyde path/to/file` opens it on startup.
         let open = std::env::args()
@@ -335,12 +427,7 @@ impl Skyde {
                     let max = (buf.content.line_count() as f32 * gutter::LINE_H - view_h).max(0.0);
                     buf.scroll = buf.scroll.clamp(0.0, max);
                     if !scrolled {
-                        let top = buf.content.cursor().position.line as f32 * gutter::LINE_H;
-                        if top < buf.scroll {
-                            buf.scroll = top;
-                        } else if top + gutter::LINE_H > buf.scroll + view_h {
-                            buf.scroll = top + gutter::LINE_H - view_h;
-                        }
+                        ensure_cursor_visible(buf, view_h);
                     }
                 }
             }
@@ -567,25 +654,20 @@ impl Skyde {
                 self.building = true;
                 self.status = format!("building {label}…");
                 self.console = Some(format!("$ buck2 build {label}\n"));
-                return Task::perform(
-                    async move { ske::buck::build(&root, &label) },
-                    Message::BuildFinished,
-                );
+                return Task::run(build_stream(root, label), Message::BuildEvent);
             }
-            Message::BuildFinished(result) => {
-                self.building = false;
-                let log = match &result {
-                    Ok(log) => log,
-                    Err(log) => log,
-                };
-                if let Some(console) = &mut self.console {
-                    console.push_str(log);
+            Message::BuildEvent(event) => match event {
+                BuildEvent::Line(line) => {
+                    if let Some(console) = &mut self.console {
+                        console.push_str(&line);
+                        console.push('\n');
+                    }
                 }
-                self.status = match result {
-                    Ok(_) => "build ok".into(),
-                    Err(_) => "build failed".into(),
-                };
-            }
+                BuildEvent::Done(ok) => {
+                    self.building = false;
+                    self.status = if ok { "build ok" } else { "build failed" }.into();
+                }
+            },
             Message::CloseConsole => {
                 self.console = None;
             }
@@ -631,6 +713,72 @@ impl Skyde {
                     return window::close(id);
                 }
             }
+            Message::ResizeWindow(direction) => {
+                if let Some(id) = self.window_id {
+                    return window::drag_resize(id, direction);
+                }
+            }
+            Message::MouseMoved(p) => {
+                self.cursor = p;
+            }
+            Message::OpenContext(kind) => {
+                // Right-click selects, like every file manager.
+                match &kind {
+                    CtxKind::Entry { path, .. } => self.selected = Some(path.clone()),
+                    CtxKind::Target(i) => self.selected_target = Some(*i),
+                    CtxKind::Package(_) => {}
+                }
+                self.context = Some((self.cursor, kind));
+            }
+            Message::CtxAction(msg) => {
+                self.context = None;
+                return self.update(*msg);
+            }
+            Message::CloseContext => {
+                self.context = None;
+            }
+            Message::NewTargetIn(dir) => {
+                self.selected = Some(dir);
+                self.view_mode = ViewMode::Targets;
+                self.status = "pick a rule and a name in the sidebar form".into();
+            }
+            Message::OpenTargetSource(i) => {
+                self.context = None;
+                let Some(t) = self.all_targets().get(i) else {
+                    return Task::none();
+                };
+                let (label, rule, name) = (t.label.clone(), t.rule_name().to_owned(), t.name.clone());
+                let Some((file, _)) = self.locate(&label) else {
+                    self.status = format!("cannot find the BUCK file for {label}");
+                    return Task::none();
+                };
+                let task = self.update(Message::Open(file.clone()));
+                self.view_mode = ViewMode::Files;
+                if let Some(buf) = self
+                    .active
+                    .and_then(|j| self.open.get_mut(j))
+                    .filter(|b| b.path.as_deref() == Some(file.as_path()))
+                {
+                    let src = buf.content.text();
+                    match ske::rule_line(&src, &rule, &name) {
+                        Ok(line) => {
+                            buf.content
+                                .perform(text_editor::Action::Move(text_editor::Motion::DocumentStart));
+                            for _ in 0..line {
+                                buf.content.perform(text_editor::Action::Move(text_editor::Motion::Down));
+                            }
+                            buf.content.perform(text_editor::Action::SelectLine);
+                            let view_h = self.editor_text_h.get();
+                            let max =
+                                (buf.content.line_count() as f32 * gutter::LINE_H - view_h).max(0.0);
+                            buf.scroll = buf.scroll.clamp(0.0, max);
+                            ensure_cursor_visible(buf, view_h);
+                        }
+                        Err(e) => self.status = format!("found the file, not the rule: {e}"),
+                    }
+                }
+                return task;
+            }
         }
         Task::none()
     }
@@ -660,7 +808,111 @@ impl Skyde {
             .width(Fill)
             .style(canvas_bg);
 
-        column![self.titlebar(), body, self.status_bar()].into()
+        let ui = column![self.titlebar(), body, self.status_bar()];
+
+        // Stack so the context menu and window-resize grips can float on top.
+        // The mouse_area only records the cursor for context-menu placement.
+        let mut layers = stack![mouse_area(ui).on_move(Message::MouseMoved)]
+            .width(Fill)
+            .height(Fill);
+        if let Some((at, kind)) = &self.context {
+            layers = layers.push(
+                mouse_area(Space::new().width(Fill).height(Fill))
+                    .on_press(Message::CloseContext)
+                    .on_right_press(Message::CloseContext),
+            );
+            layers = layers.push(self.context_menu(*at, kind));
+        }
+        if !self.maximized {
+            for grip in resize_grips() {
+                layers = layers.push(grip);
+            }
+        }
+        layers.into()
+    }
+
+    fn context_menu(&self, at: Point, kind: &CtxKind) -> Element<'_, Message> {
+        let item = |label: String, msg: Message| -> Element<'_, Message> {
+            button(text(label).size(12).color(TEXT))
+                .on_press(Message::CtxAction(Box::new(msg)))
+                .width(Fill)
+                .padding([5, 10])
+                .style(menu_button)
+                .into()
+        };
+        let mut items: Vec<Element<'_, Message>> = Vec::new();
+        match kind {
+            CtxKind::Entry { path, is_dir } => {
+                if *is_dir {
+                    items.push(item(
+                        "new build target here…".into(),
+                        Message::NewTargetIn(path.clone()),
+                    ));
+                } else {
+                    items.push(item("open".into(), Message::Open(path.clone())));
+                    let owners = self.index.targets_of(path);
+                    if let Some(t) = self
+                        .selected_target
+                        .and_then(|i| self.all_targets().get(i))
+                        .filter(|t| !owners.contains(&t.label.as_str()))
+                    {
+                        items.push(item(
+                            format!("add to {}", t.name),
+                            Message::AddSelectedFile(t.label.clone()),
+                        ));
+                    }
+                    if let Some(dir) = path.parent() {
+                        items.push(item(
+                            "new build target here…".into(),
+                            Message::NewTargetIn(dir.to_path_buf()),
+                        ));
+                    }
+                }
+            }
+            CtxKind::Target(i) => {
+                if let Some(t) = self.all_targets().get(*i) {
+                    items.push(item(
+                        format!("build {}", t.name),
+                        Message::BuildTarget(t.label.clone()),
+                    ));
+                    items.push(item("open BUCK file".into(), Message::OpenTargetSource(*i)));
+                    items.push(item(
+                        "delete target".into(),
+                        Message::DeleteTarget(t.label.clone()),
+                    ));
+                }
+            }
+            CtxKind::Package(pkg) => {
+                let dir = self
+                    .index
+                    .buck_files
+                    .get(pkg)
+                    .and_then(|f| Some(f.parent()?.to_path_buf()))
+                    .or_else(|| {
+                        pkg.split_once("//").map(|(_, p)| {
+                            self.buck_root.as_deref().unwrap_or(&self.root).join(p)
+                        })
+                    });
+                if let Some(dir) = dir {
+                    items.push(item(
+                        "new target in this package…".into(),
+                        Message::NewTargetIn(dir),
+                    ));
+                }
+            }
+        }
+        container(
+            container(column(items).width(Length::Fixed(200.0)))
+                .padding(4)
+                .style(context_panel),
+        )
+        .padding(iced::Padding {
+            top: at.y,
+            left: at.x,
+            right: 0.0,
+            bottom: 0.0,
+        })
+        .into()
     }
 
     /// Nodes for the graph canvas: every known target, plus one external node
@@ -782,7 +1034,10 @@ impl Skyde {
         container(
             column![
                 header,
-                scrollable(text(log).size(12).font(NERD_FONT).color(TEXT)).height(Fill)
+                // anchored bottom: follows new output while streaming
+                scrollable(text(log).size(12).font(NERD_FONT).color(TEXT))
+                    .anchor_bottom()
+                    .height(Fill)
             ]
             .spacing(4)
             .padding(8),
@@ -1131,29 +1386,31 @@ impl Skyde {
         for (pkg, indices) in packages {
             let collapsed = self.collapsed_pkgs.contains(pkg);
             let short = pkg.split_once("//").map(|(_, p)| p).unwrap_or(pkg);
+            let pkg_row = button(
+                row![
+                    text(if collapsed {
+                        ICON_CHEVRON_RIGHT
+                    } else {
+                        ICON_CHEVRON_DOWN
+                    })
+                    .size(12)
+                    .font(NERD_FONT)
+                    .color(MUTED),
+                    text(format!("//{short}")).size(13).color(TEXT),
+                    space::horizontal(),
+                    text(indices.len().to_string()).size(11).color(MUTED)
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            )
+            .on_press(Message::TogglePkg(pkg.to_owned()))
+            .width(Fill)
+            .padding([3, 8])
+            .style(move |_t: &Theme, status| tree_button(false, status));
             rows.push(
-                button(
-                    row![
-                        text(if collapsed {
-                            ICON_CHEVRON_RIGHT
-                        } else {
-                            ICON_CHEVRON_DOWN
-                        })
-                        .size(12)
-                        .font(NERD_FONT)
-                        .color(MUTED),
-                        text(format!("//{short}")).size(13).color(TEXT),
-                        space::horizontal(),
-                        text(indices.len().to_string()).size(11).color(MUTED)
-                    ]
-                    .spacing(6)
-                    .align_y(Alignment::Center),
-                )
-                .on_press(Message::TogglePkg(pkg.to_owned()))
-                .width(Fill)
-                .padding([3, 8])
-                .style(move |_t: &Theme, status| tree_button(false, status))
-                .into(),
+                mouse_area(pkg_row)
+                    .on_right_press(Message::OpenContext(CtxKind::Package(pkg.to_owned())))
+                    .into(),
             );
             if collapsed {
                 continue;
@@ -1163,19 +1420,22 @@ impl Skyde {
                 let is_selected = self.selected_target == Some(i);
                 let (icon, color) = kind_icon(self.target_kind(t));
                 rows.push(
-                    button(
-                        row![
-                            Space::new().width(Length::Fixed(14.0)),
-                            text(icon).size(12).font(NERD_FONT).color(color),
-                            text(&t.name).size(13).color(TEXT)
-                        ]
-                        .spacing(6)
-                        .align_y(Alignment::Center),
+                    mouse_area(
+                        button(
+                            row![
+                                Space::new().width(Length::Fixed(14.0)),
+                                text(icon).size(12).font(NERD_FONT).color(color),
+                                text(&t.name).size(13).color(TEXT)
+                            ]
+                            .spacing(6)
+                            .align_y(Alignment::Center),
+                        )
+                        .on_press(Message::SelectTarget(i))
+                        .width(Fill)
+                        .padding([3, 8])
+                        .style(move |_t: &Theme, status| tree_button(is_selected, status)),
                     )
-                    .on_press(Message::SelectTarget(i))
-                    .width(Fill)
-                    .padding([3, 8])
-                    .style(move |_t: &Theme, status| tree_button(is_selected, status))
+                    .on_right_press(Message::OpenContext(CtxKind::Target(i)))
                     .into(),
                 );
             }
@@ -1438,11 +1698,17 @@ fn tree_rows<'a>(
         }
 
         rows.push(
-            button(content)
-            .on_press(msg)
-            .width(Fill)
-            .padding([3, 8])
-            .style(move |_t: &Theme, status| tree_button(is_selected, status))
+            mouse_area(
+                button(content)
+                    .on_press(msg)
+                    .width(Fill)
+                    .padding([3, 8])
+                    .style(move |_t: &Theme, status| tree_button(is_selected, status)),
+            )
+            .on_right_press(Message::OpenContext(CtxKind::Entry {
+                path: node.path.clone(),
+                is_dir: matches!(node.kind, tree::Kind::Dir { .. }),
+            }))
             .into(),
         );
 
@@ -1502,6 +1768,56 @@ fn canvas_bg(_theme: &Theme) -> container::Style {
 fn tabstrip_bg(_theme: &Theme) -> container::Style {
     container::Style {
         background: Some(Background::Color(BG_PANEL)),
+        ..container::Style::default()
+    }
+}
+
+/// Invisible edge/corner strips that start an interactive window resize —
+/// with OS decorations off, the compositor gives us no handles of its own.
+fn resize_grips() -> Vec<Element<'static, Message>> {
+    use iced::alignment::{Horizontal, Vertical};
+    use mouse::Interaction as I;
+    use window::Direction as D;
+
+    let grip = |dir: D, w: Length, h: Length, cursor: I, ax: Horizontal, ay: Vertical| {
+        container(
+            mouse_area(Space::new().width(w).height(h))
+                .on_press(Message::ResizeWindow(dir))
+                .interaction(cursor),
+        )
+        .width(Fill)
+        .height(Fill)
+        .align_x(ax)
+        .align_y(ay)
+        .into()
+    };
+    let edge = Length::Fixed(5.0);
+    let corner = Length::Fixed(12.0);
+    vec![
+        grip(D::North, Fill, edge, I::ResizingVertically, Horizontal::Center, Vertical::Top),
+        grip(D::South, Fill, edge, I::ResizingVertically, Horizontal::Center, Vertical::Bottom),
+        grip(D::West, edge, Fill, I::ResizingHorizontally, Horizontal::Left, Vertical::Center),
+        grip(D::East, edge, Fill, I::ResizingHorizontally, Horizontal::Right, Vertical::Center),
+        grip(D::NorthWest, corner, corner, I::ResizingDiagonallyDown, Horizontal::Left, Vertical::Top),
+        grip(D::NorthEast, corner, corner, I::ResizingDiagonallyUp, Horizontal::Right, Vertical::Top),
+        grip(D::SouthWest, corner, corner, I::ResizingDiagonallyUp, Horizontal::Left, Vertical::Bottom),
+        grip(D::SouthEast, corner, corner, I::ResizingDiagonallyDown, Horizontal::Right, Vertical::Bottom),
+    ]
+}
+
+fn context_panel(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(BG_PANEL)),
+        border: Border {
+            color: BORDER,
+            width: 1.0,
+            radius: border::radius(6),
+        },
+        shadow: iced::Shadow {
+            color: Color::from_rgba8(0, 0, 0, 0.5),
+            offset: iced::Vector::new(0.0, 4.0),
+            blur_radius: 16.0,
+        },
         ..container::Style::default()
     }
 }

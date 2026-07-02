@@ -53,12 +53,17 @@ Each milestone is usable on its own.
 - Open/save files in the editor; dirty tracking; tabs; ctrl+s/n/w. ✅
 - Zed-style status bar: `row:col`, language. ✅ (encoding todo)
 - Mockup theme: warm dark palette, orange accent, icon rail. ✅
+- Window resize grips on all edges/corners (needed since decorations are off). ✅
+- Right-click context menus: tree entries (new target here / open / add to
+  selected target), targets (build / open BUCK / delete), packages (new target). ✅
 
 ### M1 — Buck2 awareness (read-only) ✅ (2026-07-02)
 - Detect a buck2 workspace (`.buckconfig`); run `buck2 targets //... --json`. ✅ (`ske::buck`)
 - Target view in sidebar: packages → targets, typed icons. ✅
 - Click target → inspector panel (name, type, srcs, deps, visibility). ✅
-- Build button runs `buck2 build`, output in a console panel. ✅ (streaming + per-target ✓/● state still todo)
+- Build button runs `buck2 build`, output streams line-by-line into the console
+  panel (`--console simple`, reader threads → iced stream). ✅ (per-target ✓/●
+  cache state still todo)
 - Verified against a real buck2 workspace (2026-07-02, bundled prelude):
   `buck2 targets --json` parses, cell prefixes (`root//demo`) and qualified srcs
   are normalized to the index's `//demo` + `src/main.rs` forms, dep edges resolve
@@ -87,9 +92,10 @@ Each milestone is usable on its own.
   buck2), hand-rolled longest-path layering, left→right like the mockup. ✅
 - Unresolved deps render as muted "extern" nodes (cargo/prelude deps). ✅
 - Kind-colored state dots, click→inspector, pointer cursor on nodes. ✅
-- Todo: pan/zoom, per-package filtering (currently whole workspace), double-click
-  →open BUCK at rule, "Affected" filter (needs buck2 + git diff), edge crossing
-  reduction within layers.
+- Double-click on a node opens its BUCK file with the rule's first line
+  selected (`ske::rule_line`). ✅
+- Todo: pan/zoom, per-package filtering (currently whole workspace), "Affected"
+  filter (needs buck2 + git diff), edge crossing reduction within layers.
 
 ### M5 — Language services
 - Spawn LSP from template config (`lsp.cmd`), speak LSP over stdio (`lsp-types` + `lsp-server` or `async-lsp` crates).
