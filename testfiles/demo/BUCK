@@ -6,7 +6,7 @@ rust_binary(
 
 rust_library(
     name = "demolib",
-    srcs = ["src/lib.rs"],
+    srcs = ["src/lib.rs", "src/main.rs"],
     visibility = ["PUBLIC"],
 )
 

@@ -34,18 +34,29 @@ const ICON_TARGET_TEST: &str = "\u{f0b01}"; // nf-md-alpha_t
 const ICON_REFRESH: &str = "\u{eb37}"; // nf-cod-refresh
 const ICON_ROCKET: &str = "\u{eb44}"; // nf-cod-rocket
 
-// Palette lifted from the mockups: warm near-black, orange accent, olive green.
-const BG_CANVAS: Color = Color::from_rgb8(0x14, 0x11, 0x0F); // titlebar, rail, status
-const BG_PANEL: Color = Color::from_rgb8(0x1B, 0x17, 0x14); // sidebar, tab strip
-const BG_EDITOR: Color = Color::from_rgb8(0x18, 0x14, 0x12);
-const BORDER: Color = Color::from_rgb8(0x2C, 0x26, 0x21);
-const TEXT: Color = Color::from_rgb8(0xD9, 0xD2, 0xC5);
-const MUTED: Color = Color::from_rgb8(0x80, 0x77, 0x6B);
-const ACCENT: Color = Color::from_rgb8(0xE2, 0x64, 0x3F);
-const ACCENT_BG: Color = Color::from_rgb8(0x33, 0x24, 0x1D); // selection tint
-const GREEN: Color = Color::from_rgb8(0x97, 0xB0, 0x6A);
-const YELLOW: Color = Color::from_rgb8(0xD9, 0xA0, 0x5B);
-const RED: Color = Color::from_rgb8(0xD9, 0x53, 0x4F);
+// Palette lifted from the HTML mockups (00/01): warm near-black, orange accent.
+const BG_CANVAS: Color = Color::from_rgb8(0x13, 0x12, 0x11); // window body, gaps
+const BG_BAR: Color = Color::from_rgb8(0x16, 0x14, 0x12); // titlebar, rail, status
+const BG_PANEL: Color = Color::from_rgb8(0x1A, 0x18, 0x16); // sidebar, editor, tab strip
+const BG_EDITOR: Color = BG_PANEL;
+const BG_TAB: Color = Color::from_rgb8(0x21, 0x1D, 0x19); // active tab
+const BG_CHIP: Color = Color::from_rgb8(0x24, 0x22, 0x20); // graph nodes, toolbar chips
+const BORDER: Color = Color::from_rgba8(0xF2, 0xED, 0xE6, 0.10);
+const TEXT: Color = Color::from_rgb8(0xF2, 0xED, 0xE6);
+const TEXT_DIM: Color = Color::from_rgb8(0xB5, 0xAD, 0xA4); // menus, unselected rows
+const MUTED: Color = Color::from_rgb8(0x8F, 0x88, 0x80);
+const FAINT: Color = Color::from_rgb8(0x4A, 0x45, 0x40); // line numbers
+const ACCENT: Color = Color::from_rgb8(0xE0, 0x7A, 0x5F);
+const ACCENT_BG: Color = Color::from_rgba8(0xE0, 0x7A, 0x5F, 0.10); // selection tint
+const GREEN: Color = Color::from_rgb8(0x7D, 0x9E, 0x5A);
+const YELLOW: Color = Color::from_rgb8(0xC9, 0x96, 0x3A);
+const RED: Color = Color::from_rgb8(0xC4, 0x5F, 0x5F);
+const BLUE: Color = Color::from_rgb8(0x67, 0x80, 0x98);
+
+/// The mockups tint chips/selections with low-alpha accent colors.
+fn tint(c: Color, a: f32) -> Color {
+    Color { a, ..c }
+}
 
 fn main() -> iced::Result {
     iced::application(Skyde::new, Skyde::update, Skyde::view)
@@ -1197,13 +1208,17 @@ impl Skyde {
         let mut nodes: Vec<graph::Node> = targets
             .iter()
             .enumerate()
-            .map(|(i, t)| graph::Node {
-                name: t.name.clone(),
-                sub: t.rule_name().to_string(),
-                color: kind_icon(self.target_kind(t)).1,
-                external: false,
-                target_idx: Some(i),
-                deps: Vec::new(),
+            .map(|(i, t)| {
+                let (icon, color) = kind_icon(self.target_kind(t));
+                graph::Node {
+                    name: t.name.clone(),
+                    sub: t.rule_name().to_string(),
+                    icon,
+                    color,
+                    external: false,
+                    target_idx: Some(i),
+                    deps: Vec::new(),
+                }
             })
             .collect();
 
@@ -1225,6 +1240,7 @@ impl Skyde {
                         nodes.push(graph::Node {
                             name: display,
                             sub: "extern".into(),
+                            icon: ICON_FILE,
                             color: MUTED,
                             external: true,
                             target_idx: None,
@@ -1247,10 +1263,10 @@ impl Skyde {
                     .size(12)
                     .color(MUTED),
                 space::horizontal(),
-                button(text("Build all").size(12).color(ACCENT))
+                button(text("Build all").size(12))
                     .on_press(Message::BuildTarget("//...".into()))
-                    .padding([4, 12])
-                    .style(accent_outline_button)
+                    .padding([5, 12])
+                    .style(accent_filled_button)
             ]
             .spacing(12)
             .align_y(Alignment::Center)
@@ -1270,11 +1286,42 @@ impl Skyde {
             .into()
         } else {
             let positions = graph::layout(&nodes);
-            iced::widget::canvas(graph::Program {
+            let canvas = iced::widget::canvas(graph::Program {
                 nodes,
                 positions,
                 selected: self.selected_target,
             })
+            .width(Fill)
+            .height(Fill);
+            // Kind legend, bottom left (mockup 01).
+            let swatch = |c: Color| {
+                container(Space::new().width(Length::Fixed(8.0)).height(Length::Fixed(8.0)))
+                    .style(move |_t: &Theme| container::Style {
+                        background: Some(Background::Color(c)),
+                        border: Border {
+                            radius: border::radius(2),
+                            ..Border::default()
+                        },
+                        ..container::Style::default()
+                    })
+            };
+            let mut legend = row![].spacing(10).align_y(Alignment::Center);
+            for (name, c) in [
+                ("binary", ACCENT),
+                ("library", GREEN),
+                ("test", BLUE),
+                ("web", YELLOW),
+            ] {
+                legend = legend
+                    .push(swatch(c))
+                    .push(text(name).size(11).color(MUTED));
+            }
+            stack![
+                canvas,
+                container(legend)
+                    .align_bottom(Fill)
+                    .padding(12)
+            ]
             .width(Fill)
             .height(Fill)
             .into()
@@ -1391,20 +1438,52 @@ impl Skyde {
     fn inspector(&self, t: &ske::buck::Target) -> Element<'_, Message> {
         let (icon, color) = kind_icon(self.target_kind(t));
 
+        // Tinted icon square + tinted mono chips, like the mockup inspector.
+        let icon_chip = container(text(icon).size(15).font(NERD_FONT).color(color))
+            .center_x(Length::Fixed(30.0))
+            .center_y(Length::Fixed(30.0))
+            .style(move |_t: &Theme| container::Style {
+                background: Some(Background::Color(tint(color, 0.13))),
+                border: Border {
+                    radius: border::radius(7),
+                    ..Border::default()
+                },
+                ..container::Style::default()
+            });
+        let chip = |label: String, c: Color| {
+            container(text(label).size(11).font(NERD_FONT).color(c))
+                .padding([3, 7])
+                .style(move |_t: &Theme| container::Style {
+                    background: Some(Background::Color(tint(c, 0.12))),
+                    border: Border {
+                        radius: border::radius(4),
+                        ..Border::default()
+                    },
+                    ..container::Style::default()
+                })
+        };
         let attr = |label: &'static str| text(label).size(11).color(MUTED);
         let mut body = column![
             row![
-                text(icon).size(16).font(NERD_FONT).color(color),
-                text(t.name.clone()).size(15).color(TEXT)
+                icon_chip,
+                column![
+                    text(t.name.clone()).size(15).color(TEXT),
+                    text(t.rule_name().to_owned()).size(12).color(MUTED)
+                ]
+                .spacing(1)
             ]
-            .spacing(8)
+            .spacing(10)
             .align_y(Alignment::Center),
-            text(t.rule_name().to_owned()).size(12).color(MUTED),
-            Space::new().height(Length::Fixed(8.0)),
+            row![
+                chip(kind_name(self.target_kind(t)).into(), color),
+                chip(format!("{} deps", t.deps.len()), BLUE)
+            ]
+            .spacing(6),
+            Space::new().height(Length::Fixed(4.0)),
             attr("target"),
             text(t.label.clone()).size(12).color(TEXT),
         ]
-        .spacing(4);
+        .spacing(6);
 
         if !t.srcs.is_empty() {
             body = body.push(attr("srcs"));
@@ -1424,19 +1503,20 @@ impl Skyde {
         }
 
         let build = button(
-            row![
-                text(ICON_ROCKET).size(12).font(NERD_FONT).color(ACCENT),
-                text(if self.building { "Building…" } else { "Build" })
-                    .size(13)
-                    .color(ACCENT)
-            ]
-            .spacing(6)
-            .align_y(Alignment::Center),
+            container(
+                row![
+                    text(ICON_ROCKET).size(12).font(NERD_FONT).color(Color::WHITE),
+                    text(if self.building { "Building…" } else { "Build" }).size(13)
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            )
+            .center_x(Fill),
         )
         .on_press(Message::BuildTarget(t.label.clone()))
-        .padding([6, 14])
+        .padding([7, 14])
         .width(Fill)
-        .style(accent_outline_button);
+        .style(accent_filled_button);
 
         let mut actions = column![build].spacing(6);
         if let Some(f) = self.selected.as_ref().filter(|p| p.is_file()) {
@@ -1465,7 +1545,7 @@ impl Skyde {
                 .spacing(8)
                 .padding(10),
         )
-        .width(Length::Fixed(260.0))
+        .width(Length::Fixed(286.0))
         .height(Fill)
         .clip(true)
         .style(sidebar_panel)
@@ -1476,7 +1556,7 @@ impl Skyde {
         let mut menus = row![].spacing(0).align_y(Alignment::Center);
         for name in ["File", "Edit", "Selection", "View", "Go"] {
             menus = menus.push(
-                button(text(name).size(13).color(TEXT))
+                button(text(name).size(13).color(TEXT_DIM))
                     .on_press(Message::Menu(name))
                     .padding([4, 10])
                     .style(menu_button),
@@ -1499,7 +1579,7 @@ impl Skyde {
         )
         .on_press(Message::Build)
         .padding([4, 14])
-        .style(accent_outline_button);
+        .style(accent_chip_button);
 
         let window_controls = row![
             button(text("—").size(12).color(MUTED))
@@ -1529,7 +1609,7 @@ impl Skyde {
                 .padding([0, 4]),
         )
         .width(Fill)
-        .style(canvas_bg)
+        .style(bar_bg)
         .into()
     }
 
@@ -1564,10 +1644,10 @@ impl Skyde {
             .spacing(4)
             .align_x(Alignment::Center),
         )
-        .width(Length::Fixed(40.0))
+        .width(Length::Fixed(38.0))
         .height(Fill)
-        .padding([4, 0])
-        .style(canvas_bg)
+        .padding([6, 0])
+        .style(bar_bg)
         .into()
     }
 
@@ -1578,18 +1658,41 @@ impl Skyde {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| self.root.display().to_string());
 
+        // Workspace card: inset darker chip with name + buck2 summary (mockup 01).
+        let sub = if self.buck_root.is_some() {
+            format!("buck2 · {} targets", self.all_targets().len())
+        } else {
+            "no buck2 workspace".into()
+        };
         let header = container(
-            row![
-                text(root_name).size(13).color(TEXT),
-                space::horizontal(),
-                button(text(ICON_REFRESH).size(12).font(NERD_FONT).color(MUTED))
-                    .on_press(Message::RefreshTree)
-                    .padding([2, 6])
-                    .style(menu_button),
-            ]
-            .align_y(Alignment::Center),
+            container(
+                row![
+                    column![
+                        text(root_name).size(13).color(TEXT),
+                        text(sub).size(11).color(MUTED)
+                    ]
+                    .spacing(1),
+                    space::horizontal(),
+                    button(text(ICON_REFRESH).size(12).font(NERD_FONT).color(MUTED))
+                        .on_press(Message::RefreshTree)
+                        .padding([2, 6])
+                        .style(menu_button),
+                ]
+                .align_y(Alignment::Center),
+            )
+            .padding([6, 9])
+            .width(Fill)
+            .style(|_t: &Theme| container::Style {
+                background: Some(Background::Color(BG_CANVAS)),
+                border: Border {
+                    color: BORDER,
+                    width: 1.0,
+                    radius: border::radius(6),
+                },
+                ..container::Style::default()
+            }),
         )
-        .padding([8, 10])
+        .padding(8)
         .width(Fill);
 
         let body: Element<'_, Message> = match self.view_mode {
@@ -1612,7 +1715,7 @@ impl Skyde {
         };
 
         container(column![header, body].width(Fill))
-            .width(Length::Fixed(240.0))
+            .width(Length::Fixed(224.0))
             .height(Fill)
             .clip(true)
             .style(sidebar_panel)
@@ -1682,7 +1785,7 @@ impl Skyde {
                     .size(12)
                     .font(NERD_FONT)
                     .color(MUTED),
-                    text(format!("//{short}")).size(13).color(TEXT),
+                    text(format!("//{short}")).size(13).color(TEXT_DIM),
                     space::horizontal(),
                     text(indices.len().to_string()).size(11).color(MUTED)
                 ]
@@ -1706,12 +1809,17 @@ impl Skyde {
                 let is_selected = self.selected_target == Some(i);
                 let (icon, color) = kind_icon(self.target_kind(t));
                 rows.push(
-                    mouse_area(
+                    mouse_area(row![
+                        selection_bar(is_selected),
                         button(
                             row![
                                 Space::new().width(Length::Fixed(14.0)),
                                 text(icon).size(12).font(NERD_FONT).color(color),
-                                text(&t.name).size(13).color(TEXT)
+                                text(&t.name).size(13).color(if is_selected {
+                                    TEXT
+                                } else {
+                                    TEXT_DIM
+                                })
                             ]
                             .spacing(6)
                             .align_y(Alignment::Center),
@@ -1720,7 +1828,7 @@ impl Skyde {
                         .width(Fill)
                         .padding([3, 8])
                         .style(move |_t: &Theme, status| tree_button(is_selected, status)),
-                    )
+                    ])
                     .on_right_press(Message::OpenContext(CtxKind::Target(i)))
                     .into(),
                 );
@@ -1766,7 +1874,7 @@ impl Skyde {
                 button(text("＋").size(13).color(ACCENT))
                     .on_press(Message::CreateTarget)
                     .padding([4, 10])
-                    .style(accent_outline_button)
+                    .style(accent_chip_button)
             ]
             .spacing(4)
             .align_y(Alignment::Center)
@@ -1813,7 +1921,24 @@ impl Skyde {
                 .on_press(Message::CloseTab(i))
                 .padding([6, 6])
                 .style(menu_button);
-            row![select, close].spacing(0).align_y(Alignment::Center).into()
+            // Active tab: 2px accent bar across the top (mockup 00). The bar
+            // is stacked over the tab so it stays as wide as the tab itself.
+            let body = container(row![select, close].spacing(0).align_y(Alignment::Center))
+                .padding(iced::Padding {
+                    top: 2.0,
+                    ..iced::Padding::ZERO
+                })
+                .style(move |_t: &Theme| container::Style {
+                    background: active.then_some(Background::Color(BG_TAB)),
+                    ..container::Style::default()
+                });
+            let indicator = container(Space::new().height(Length::Fixed(2.0)))
+                .width(Fill)
+                .style(move |_t: &Theme| container::Style {
+                    background: active.then_some(Background::Color(ACCENT)),
+                    ..container::Style::default()
+                });
+            stack![body, indicator].into()
         }))
         .spacing(2);
 
@@ -1920,7 +2045,7 @@ impl Skyde {
             .padding([4, 12]),
         )
         .width(Fill)
-        .style(canvas_bg)
+        .style(bar_bg)
         .into()
     }
 }
@@ -1964,7 +2089,7 @@ fn tree_rows<'a>(
         } else if node.hidden {
             MUTED
         } else {
-            TEXT
+            TEXT_DIM
         };
 
         let mut content = row![
@@ -1974,11 +2099,7 @@ fn tree_rows<'a>(
             } else {
                 icon_color
             }),
-            text(&node.name).size(13).color(if node.hidden {
-                MUTED
-            } else {
-                label_color
-            })
+            text(&node.name).size(13).color(label_color)
         ]
         .spacing(6)
         .align_y(Alignment::Center);
@@ -1993,13 +2114,14 @@ fn tree_rows<'a>(
         }
 
         rows.push(
-            mouse_area(
+            mouse_area(row![
+                selection_bar(is_selected),
                 button(content)
                     .on_press(msg)
                     .width(Fill)
                     .padding([3, 8])
                     .style(move |_t: &Theme, status| tree_button(is_selected, status)),
-            )
+            ])
             .on_right_press(Message::OpenContext(CtxKind::Entry {
                 path: node.path.clone(),
                 is_dir: matches!(node.kind, tree::Kind::Dir { .. }),
@@ -2017,13 +2139,25 @@ fn tree_rows<'a>(
     }
 }
 
+// Kind colors follow the mockup legend: binary orange, library green,
+// test blue, web yellow.
 fn kind_icon(kind: ske::buck::Kind) -> (&'static str, Color) {
     match kind {
         ske::buck::Kind::Binary => (ICON_TARGET_BUILD, ACCENT),
         ske::buck::Kind::Library => (ICON_TARGET_LIB, GREEN),
-        ske::buck::Kind::Test => (ICON_TARGET_TEST, YELLOW),
+        ske::buck::Kind::Test => (ICON_TARGET_TEST, BLUE),
         ske::buck::Kind::Web => (ICON_FILE, YELLOW),
         ske::buck::Kind::Other => (ICON_FILE, MUTED),
+    }
+}
+
+fn kind_name(kind: ske::buck::Kind) -> &'static str {
+    match kind {
+        ske::buck::Kind::Binary => "binary",
+        ske::buck::Kind::Library => "library",
+        ske::buck::Kind::Test => "test",
+        ske::buck::Kind::Web => "web",
+        ske::buck::Kind::Other => "other",
     }
 }
 
@@ -2056,6 +2190,13 @@ fn load_templates(root: &Path) -> ske::template::TemplateSet {
 fn canvas_bg(_theme: &Theme) -> container::Style {
     container::Style {
         background: Some(Background::Color(BG_CANVAS)),
+        ..container::Style::default()
+    }
+}
+
+fn bar_bg(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(BG_BAR)),
         ..container::Style::default()
     }
 }
@@ -2123,7 +2264,7 @@ fn sidebar_panel(_theme: &Theme) -> container::Style {
         border: Border {
             color: BORDER,
             width: 1.0,
-            radius: border::radius(8),
+            radius: border::radius(4),
         },
         ..container::Style::default()
     }
@@ -2135,7 +2276,7 @@ fn editor_panel(_theme: &Theme) -> container::Style {
         border: Border {
             color: BORDER,
             width: 1.0,
-            radius: border::radius(8),
+            radius: border::radius(4),
         },
         ..container::Style::default()
     }
@@ -2147,15 +2288,15 @@ fn flat_editor(_theme: &Theme, _status: text_editor::Status) -> text_editor::Sty
         border: Border::default(),
         placeholder: MUTED,
         value: TEXT,
-        selection: ACCENT_BG,
+        selection: tint(ACCENT, 0.25),
     }
 }
 
 fn menu_button(_theme: &Theme, status: button::Status) -> button::Style {
     let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
     button::Style {
-        background: hovered.then_some(Background::Color(BG_PANEL)),
-        text_color: TEXT,
+        background: hovered.then_some(Background::Color(tint(TEXT, 0.06))),
+        text_color: TEXT_DIM,
         border: Border {
             radius: border::radius(4),
             ..Border::default()
@@ -2164,15 +2305,33 @@ fn menu_button(_theme: &Theme, status: button::Status) -> button::Style {
     }
 }
 
-fn accent_outline_button(_theme: &Theme, status: button::Status) -> button::Style {
+/// Titlebar "Build": low-alpha accent chip, accent text (mockup 00).
+fn accent_chip_button(_theme: &Theme, status: button::Status) -> button::Style {
     let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
     button::Style {
-        background: Some(Background::Color(if hovered { ACCENT_BG } else { BG_PANEL })),
+        background: Some(Background::Color(tint(ACCENT, if hovered { 0.18 } else { 0.11 }))),
         text_color: ACCENT,
         border: Border {
-            color: ACCENT,
-            width: 1.0,
+            radius: border::radius(5),
+            ..Border::default()
+        },
+        ..button::Style::default()
+    }
+}
+
+/// "Build all" / inspector "Build": solid accent, white text (mockup 01).
+fn accent_filled_button(_theme: &Theme, status: button::Status) -> button::Style {
+    let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+    button::Style {
+        background: Some(Background::Color(if hovered {
+            Color::from_rgb8(0xD0, 0x68, 0x47)
+        } else {
+            ACCENT
+        })),
+        text_color: Color::WHITE,
+        border: Border {
             radius: border::radius(6),
+            ..Border::default()
         },
         ..button::Style::default()
     }
@@ -2181,10 +2340,16 @@ fn accent_outline_button(_theme: &Theme, status: button::Status) -> button::Styl
 fn rail_button(active: bool, status: button::Status) -> button::Style {
     let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
     button::Style {
-        background: (active || hovered).then_some(Background::Color(BG_PANEL)),
+        background: if active {
+            Some(Background::Color(tint(ACCENT, 0.15)))
+        } else if hovered {
+            Some(Background::Color(tint(TEXT, 0.06)))
+        } else {
+            None
+        },
         text_color: if active { ACCENT } else { MUTED },
         border: Border {
-            radius: border::radius(6),
+            radius: border::radius(7),
             ..Border::default()
         },
         ..button::Style::default()
@@ -2195,17 +2360,13 @@ fn tab_button(active: bool, status: button::Status) -> button::Style {
     let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
     button::Style {
         background: Some(Background::Color(if active {
-            BG_EDITOR
+            BG_TAB
         } else if hovered {
-            BG_CANVAS
+            tint(TEXT, 0.04)
         } else {
             Color::TRANSPARENT
         })),
-        text_color: if active { TEXT } else { MUTED },
-        border: Border {
-            radius: border::radius(6),
-            ..Border::default()
-        },
+        text_color: if active { TEXT } else { TEXT_DIM },
         ..button::Style::default()
     }
 }
@@ -2216,17 +2377,24 @@ fn tree_button(selected: bool, status: button::Status) -> button::Style {
         background: if selected {
             Some(Background::Color(ACCENT_BG))
         } else if hovered {
-            Some(Background::Color(BG_CANVAS))
+            Some(Background::Color(tint(TEXT, 0.04)))
         } else {
             None
         },
-        text_color: TEXT,
-        border: Border {
-            radius: border::radius(4),
-            ..Border::default()
-        },
+        text_color: TEXT_DIM,
         ..button::Style::default()
     }
+}
+
+/// 2px accent bar flush left of a selected tree row (mockups 00/01).
+fn selection_bar(selected: bool) -> Element<'static, Message> {
+    container(Space::new().width(Length::Fixed(2.0)))
+        .height(Fill)
+        .style(move |_t: &Theme| container::Style {
+            background: selected.then_some(Background::Color(ACCENT)),
+            ..container::Style::default()
+        })
+        .into()
 }
 
 fn close_button(_theme: &Theme, status: button::Status) -> button::Style {

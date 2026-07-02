@@ -10,7 +10,7 @@ use iced::{Color, Point, Rectangle, Renderer, Size, Theme};
 use crate::Message;
 
 pub const NODE_W: f32 = 170.0;
-pub const NODE_H: f32 = 52.0;
+pub const NODE_H: f32 = 50.0;
 const GAP_X: f32 = 70.0;
 const GAP_Y: f32 = 24.0;
 const MARGIN: f32 = 24.0;
@@ -18,6 +18,8 @@ const MARGIN: f32 = 24.0;
 pub struct Node {
     pub name: String,
     pub sub: String,
+    /// Nerd Font glyph shown in the tinted kind chip.
+    pub icon: &'static str,
     pub color: Color,
     pub external: bool,
     /// Index into the app's target list, if this node is a real target.
@@ -144,24 +146,40 @@ impl canvas::Program<Message> for Program {
         for (i, node) in self.nodes.iter().enumerate() {
             let rect = self.node_rect(i);
             let body = Path::rounded_rectangle(rect.position(), rect.size(), 8.0.into());
-            frame.fill(&body, crate::BG_PANEL);
             let selected = self.selected == Some(i) && node.target_idx.is_some();
+            // Mockup cards: #242220, selected one gets an accent tint + ring.
+            frame.fill(&body, crate::BG_CHIP);
+            if selected {
+                frame.fill(&body, crate::tint(crate::ACCENT, 0.10));
+            }
             frame.stroke(
                 &body,
                 Stroke::default()
                     .with_color(if selected { crate::ACCENT } else { crate::BORDER })
                     .with_width(if selected { 1.5 } else { 1.0 }),
             );
-            // kind dot
-            let dot = Path::circle(
-                Point::new(rect.x + NODE_W - 14.0, rect.y + 14.0),
-                3.0,
+
+            // Tinted kind chip with the target's icon glyph.
+            let chip = Path::rounded_rectangle(
+                Point::new(rect.x + 10.0, rect.y + 10.0),
+                iced::Size::new(30.0, 30.0),
+                7.0.into(),
             );
-            frame.fill(&dot, node.color);
+            frame.fill(&chip, crate::tint(node.color, 0.13));
+            frame.fill_text(Text {
+                content: node.icon.to_string(),
+                position: Point::new(rect.x + 25.0, rect.y + 25.0),
+                color: node.color,
+                size: 14.0.into(),
+                font: crate::NERD_FONT,
+                align_x: iced::widget::text::Alignment::Center,
+                align_y: alignment::Vertical::Center,
+                ..Text::default()
+            });
 
             frame.fill_text(Text {
                 content: node.name.clone(),
-                position: Point::new(rect.x + 12.0, rect.y + 10.0),
+                position: Point::new(rect.x + 48.0, rect.y + 9.0),
                 color: if node.external {
                     crate::MUTED
                 } else {
@@ -173,7 +191,7 @@ impl canvas::Program<Message> for Program {
             });
             frame.fill_text(Text {
                 content: node.sub.clone(),
-                position: Point::new(rect.x + 12.0, rect.y + 28.0),
+                position: Point::new(rect.x + 48.0, rect.y + 26.0),
                 color: crate::MUTED,
                 size: 11.0.into(),
                 align_y: alignment::Vertical::Top,

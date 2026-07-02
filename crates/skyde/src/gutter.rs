@@ -41,9 +41,9 @@ impl canvas::Program<Message> for Gutter {
                 content: (i + 1).to_string(),
                 position: Point::new(bounds.width - 10.0, i as f32 * LINE_H - self.scroll),
                 color: if i == self.current {
-                    crate::TEXT
+                    crate::TEXT_DIM
                 } else {
-                    crate::MUTED
+                    crate::FAINT
                 },
                 size: TEXT_SIZE.into(),
                 line_height: LineHeight::Absolute(LINE_H.into()),
