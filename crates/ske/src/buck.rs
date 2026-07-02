@@ -129,6 +129,22 @@ fn str_list(v: Option<&serde_json::Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Set up a fresh buck2 workspace in `dir`: `git init` + `buck2 init --git`
+/// (the generated .buckconfig uses the prelude bundled with the binary).
+pub fn init(dir: &Path) -> Result<(), String> {
+    let _ = Command::new("git").arg("init").current_dir(dir).output();
+    let out = Command::new("buck2")
+        .args(["init", "--git"])
+        .current_dir(dir)
+        .output()
+        .map_err(|e| format!("failed to run buck2: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
 /// Spawn `buck2 build <label>` with piped stdout/stderr so callers can
 /// stream the output line by line. `--console simple` keeps stderr free of
 /// superconsole redraw escapes.

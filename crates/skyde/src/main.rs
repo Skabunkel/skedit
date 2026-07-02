@@ -100,7 +100,6 @@ struct Skyde {
     open: Vec<Buffer>,
     active: Option<usize>,
     view_mode: ViewMode,
-    show_menu: bool,
     status: String,
     window_id: Option<window::Id>,
     maximized: bool,
@@ -140,25 +139,6 @@ impl std::fmt::Display for ViewMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FileAction {
-    New,
-    Save,
-}
-
-impl FileAction {
-    const ALL: [FileAction; 2] = [FileAction::New, FileAction::Save];
-}
-
-impl std::fmt::Display for FileAction {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            FileAction::New => "New",
-            FileAction::Save => "Save",
-        })
-    }
-}
-
 #[derive(Debug, Clone)]
 enum Message {
     Edit(text_editor::Action),
@@ -183,7 +163,6 @@ enum Message {
     BuildEvent(BuildEvent),
     CloseConsole,
     Menu(&'static str),
-    FileAction(FileAction),
     ChangeView(ViewMode),
     WindowOpened(window::Id),
     DragWindow,
@@ -200,6 +179,10 @@ enum Message {
     NewEntryPrompt { dir: PathBuf, folder: bool },
     NewEntryName(String),
     NewEntryCreate,
+    AddFileAs { label: String, attr: String },
+    SelectTargetByLabel(String),
+    WorkspacePrompt { create: bool },
+    WorkspaceSet,
 }
 
 /// One line / completion event from a streaming `buck2 build`.
@@ -217,6 +200,10 @@ enum CtxKind {
     Package(String),
     /// The menu morphed into a "name this new file/folder" prompt.
     NewEntry { dir: PathBuf, folder: bool },
+    /// The titlebar File menu (reuses the context-menu plumbing).
+    FileMenu,
+    /// Path prompt for creating/opening a workspace.
+    Workspace { create: bool },
 }
 
 /// Mirror cosmic-text's keep-the-cursor-in-view behaviour so the gutter
@@ -347,7 +334,6 @@ impl Skyde {
             } else {
                 ViewMode::Files
             },
-            show_menu: false,
             status,
             window_id: None,
             maximized: false,
@@ -611,50 +597,10 @@ impl Skyde {
                 }
             }
             Message::AddSelectedFile(label) => {
-                let Some(file) = self.selected.clone().filter(|p| p.is_file()) else {
-                    self.status = "select a file in the Files view first".into();
-                    return Task::none();
-                };
-                let Some((buck_file, t)) = self.locate(&label) else {
-                    self.status = format!("cannot locate BUCK file for {label}");
-                    return Task::none();
-                };
-                let pkg_dir = buck_file.parent().unwrap_or(&self.root).to_path_buf();
-                let Ok(rel) = file.strip_prefix(&pkg_dir) else {
-                    self.status = format!(
-                        "{} is outside package {}",
-                        file.display(),
-                        t.package
-                    );
-                    return Task::none();
-                };
-                let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
-                let attr = self
-                    .templates
-                    .rule(&t.rule_type)
-                    .and_then(|(_, r)| r.attr_for_ext(ext))
-                    .unwrap_or("srcs")
-                    .to_string();
-                let selector = ske::RuleSelector {
-                    rule_name: t.rule_type.clone(),
-                    attr: attr.clone(),
-                    name: Some(t.name.clone()),
-                };
-                let entry = rel.to_string_lossy().replace('\\', "/");
-                match std::fs::read_to_string(&buck_file)
-                    .map_err(|e| format!("{e}"))
-                    .and_then(|src| {
-                        ske::add_entry(&src, &selector, &entry).map_err(|e| format!("{e:?}"))
-                    })
-                    .and_then(|new_src| {
-                        std::fs::write(&buck_file, new_src).map_err(|e| format!("{e}"))
-                    }) {
-                    Ok(()) => {
-                        self.status = format!("added {entry} to {label} ({attr})");
-                        self.after_buck_edit(&buck_file);
-                    }
-                    Err(e) => self.status = format!("add failed: {e}"),
-                }
+                self.add_selected_file(&label, None);
+            }
+            Message::AddFileAs { label, attr } => {
+                self.add_selected_file(&label, Some(&attr));
             }
             Message::BuildTarget(label) => {
                 let Some(root) = self.buck_root.clone() else {
@@ -687,17 +633,13 @@ impl Skyde {
             }
             Message::Menu(name) => {
                 if name == "File" {
-                    self.show_menu = !self.show_menu;
+                    self.context = match self.context.take() {
+                        Some((_, CtxKind::FileMenu)) => None,
+                        _ => Some((self.cursor, CtxKind::FileMenu)),
+                    };
                 } else {
                     self.status = format!("{name} menu: not implemented yet");
                 }
-            }
-            Message::FileAction(action) => {
-                self.show_menu = false;
-                return self.update(match action {
-                    FileAction::New => Message::NewFile,
-                    FileAction::Save => Message::Save,
-                });
             }
             Message::ChangeView(mode) => {
                 self.view_mode = mode;
@@ -740,7 +682,10 @@ impl Skyde {
                 match &kind {
                     CtxKind::Entry { path, .. } => self.selected = Some(path.clone()),
                     CtxKind::Target(i) => self.selected_target = Some(*i),
-                    CtxKind::Package(_) | CtxKind::NewEntry { .. } => {}
+                    CtxKind::Package(_)
+                    | CtxKind::NewEntry { .. }
+                    | CtxKind::FileMenu
+                    | CtxKind::Workspace { .. } => {}
                 }
                 self.context = Some((self.cursor, kind));
             }
@@ -833,8 +778,125 @@ impl Skyde {
                     Err(e) => self.status = format!("create failed: {e}"),
                 }
             }
+            Message::SelectTargetByLabel(label) => {
+                self.selected_target = self.all_targets().iter().position(|t| t.label == label);
+                self.status = format!("active target: {label}");
+            }
+            Message::WorkspacePrompt { create } => {
+                self.new_entry = if create {
+                    self.root
+                        .parent()
+                        .unwrap_or(&self.root)
+                        .join("my-project")
+                        .display()
+                        .to_string()
+                } else {
+                    self.root.display().to_string()
+                };
+                self.context = Some((self.cursor, CtxKind::Workspace { create }));
+                return iced::widget::operation::focus(NEW_ENTRY_INPUT);
+            }
+            Message::WorkspaceSet => {
+                let Some((_, CtxKind::Workspace { create })) = self.context.take() else {
+                    return Task::none();
+                };
+                let input = self.new_entry.trim().to_owned();
+                if input.is_empty() {
+                    return Task::none();
+                }
+                let path = match input.strip_prefix("~/") {
+                    Some(rest) => match std::env::var_os("HOME") {
+                        Some(home) => PathBuf::from(home).join(rest),
+                        None => PathBuf::from(&input),
+                    },
+                    None => PathBuf::from(&input),
+                };
+                if create {
+                    if let Err(e) = std::fs::create_dir_all(&path) {
+                        self.status = format!("cannot create {}: {e}", path.display());
+                        return Task::none();
+                    }
+                    match ske::buck::init(&path) {
+                        Ok(()) => self.status = "workspace created (buck2 init)".into(),
+                        Err(e) => {
+                            self.status = format!("folder created; buck2 init failed: {e}");
+                        }
+                    }
+                } else if !path.is_dir() {
+                    self.status = format!("{} is not a folder", path.display());
+                    return Task::none();
+                }
+                return self.switch_root(path);
+            }
         }
         Task::none()
+    }
+
+    /// Point the whole app at a different workspace root.
+    fn switch_root(&mut self, root: PathBuf) -> Task<Message> {
+        self.root = root;
+        self.tree = tree::read_dir(&self.root);
+        self.buck_root = ske::buck::find_root(&self.root);
+        self.templates = load_templates(&self.root);
+        self.index = ske::index::scan(&self.root, &self.templates);
+        self.targets.clear();
+        self.targets_err = None;
+        self.selected = None;
+        self.selected_target = None;
+        self.collapsed_pkgs.clear();
+        self.status = format!("workspace: {}", self.root.display());
+        match self.buck_root.clone() {
+            Some(r) => load_targets(r),
+            None => Task::none(),
+        }
+    }
+
+    /// Add the currently selected file to `label` — under `attr` if given,
+    /// otherwise wherever the template routes its extension.
+    fn add_selected_file(&mut self, label: &str, attr: Option<&str>) {
+        let Some(file) = self.selected.clone().filter(|p| p.is_file()) else {
+            self.status = "select a file in the Files view first".into();
+            return;
+        };
+        let Some((buck_file, t)) = self.locate(label) else {
+            self.status = format!("cannot locate BUCK file for {label}");
+            return;
+        };
+        let rule_name = t.rule_name().to_owned();
+        let target_name = t.name.clone();
+        let package = t.package.clone();
+        let pkg_dir = buck_file.parent().unwrap_or(&self.root).to_path_buf();
+        let Ok(rel) = file.strip_prefix(&pkg_dir) else {
+            self.status = format!("{} is outside package {package}", file.display());
+            return;
+        };
+        let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let attr = match attr {
+            Some(a) => a.to_owned(),
+            None => self
+                .templates
+                .rule(&rule_name)
+                .and_then(|(_, r)| r.attr_for_ext(ext))
+                .unwrap_or("srcs")
+                .to_owned(),
+        };
+        let selector = ske::RuleSelector {
+            rule_name,
+            attr: attr.clone(),
+            name: Some(target_name),
+        };
+        let entry = rel.to_string_lossy().replace('\\', "/");
+        match std::fs::read_to_string(&buck_file)
+            .map_err(|e| format!("{e}"))
+            .and_then(|src| ske::add_entry(&src, &selector, &entry).map_err(|e| format!("{e:?}")))
+            .and_then(|new_src| std::fs::write(&buck_file, new_src).map_err(|e| format!("{e}")))
+        {
+            Ok(()) => {
+                self.status = format!("added {entry} to {label} ({attr})");
+                self.after_buck_edit(&buck_file);
+            }
+            Err(e) => self.status = format!("add failed: {e}"),
+        }
     }
 
     /// Re-read the file tree, keeping directories expanded.
@@ -979,10 +1041,27 @@ impl Skyde {
                         .and_then(|i| self.all_targets().get(i))
                         .filter(|t| !owners.contains(&t.label.as_str()))
                     {
-                        items.push(item(
-                            format!("add to {}", t.name),
-                            Message::AddSelectedFile(t.label.clone()),
-                        ));
+                        // One item per file-carrying attr the template knows
+                        // for this rule (srcs, hdrs, …), so a .h can go to
+                        // either explicitly.
+                        let mut attrs: Vec<String> = Vec::new();
+                        if let Some((_, r)) = self.templates.rule(t.rule_name()) {
+                            attrs.extend(r.srcs.iter().map(|a| a.attr.clone()));
+                            attrs.extend(r.hdrs.iter().map(|a| a.attr.clone()));
+                        }
+                        if attrs.is_empty() {
+                            attrs.push("srcs".into());
+                        }
+                        attrs.dedup();
+                        for attr in attrs {
+                            items.push(item(
+                                format!("add to {} ({attr})", t.name),
+                                Message::AddFileAs {
+                                    label: t.label.clone(),
+                                    attr,
+                                },
+                            ));
+                        }
                     }
                     if let Some(dir) = path.parent() {
                         items.push(item(
@@ -1055,9 +1134,50 @@ impl Skyde {
                         .into(),
                 );
             }
+            CtxKind::FileMenu => {
+                items.push(item("new file (ctrl+n)".into(), Message::NewFile));
+                items.push(item("save (ctrl+s)".into(), Message::Save));
+                items.push(item(
+                    "new workspace…".into(),
+                    Message::WorkspacePrompt { create: true },
+                ));
+                items.push(item(
+                    "open workspace…".into(),
+                    Message::WorkspacePrompt { create: false },
+                ));
+            }
+            CtxKind::Workspace { create } => {
+                items.push(
+                    container(
+                        text(if *create {
+                            "create a workspace at (runs buck2 init):"
+                        } else {
+                            "open the workspace at:"
+                        })
+                        .size(11)
+                        .color(MUTED),
+                    )
+                    .padding([2, 6])
+                    .into(),
+                );
+                items.push(
+                    text_input("path", &self.new_entry)
+                        .id(NEW_ENTRY_INPUT)
+                        .on_input(Message::NewEntryName)
+                        .on_submit(Message::WorkspaceSet)
+                        .size(12)
+                        .padding([4, 8])
+                        .into(),
+                );
+            }
         }
+        let width = match kind {
+            // Paths need room.
+            CtxKind::Workspace { .. } => 340.0,
+            _ => 200.0,
+        };
         container(
-            container(column(items).width(Length::Fixed(200.0)))
+            container(column(items).width(Length::Fixed(width)))
                 .padding(4)
                 .style(context_panel),
         )
@@ -1362,19 +1482,6 @@ impl Skyde {
                     .style(menu_button),
             );
         }
-        if self.show_menu {
-            menus = menus.push(
-                pick_list(
-                    &FileAction::ALL[..],
-                    None::<FileAction>,
-                    Message::FileAction,
-                )
-                .placeholder("File…")
-                .padding([2, 8])
-                .text_size(13),
-            );
-        }
-
         let drag_area = mouse_area(
             container(space::horizontal())
                 .height(Length::Fixed(34.0))
@@ -1495,9 +1602,11 @@ impl Skyde {
                     &self.index,
                     &mut rows,
                 );
-                scrollable(column(rows).spacing(1).padding([0, 6]))
-                    .height(Fill)
-                    .into()
+                column![
+                    scrollable(column(rows).spacing(1).padding([0, 6])).height(Fill),
+                    container(self.active_target_picker()).padding(8)
+                ]
+                .into()
             }
             ViewMode::Targets => self.targets_body(),
         };
@@ -1508,6 +1617,28 @@ impl Skyde {
             .clip(true)
             .style(sidebar_panel)
             .into()
+    }
+
+    /// Bottom-of-the-file-tree dropdown: which target "add to …" acts on.
+    fn active_target_picker(&self) -> Element<'_, Message> {
+        let labels: Vec<String> = self.all_targets().iter().map(|t| t.label.clone()).collect();
+        if labels.is_empty() {
+            return Space::new().into();
+        }
+        let selected = self
+            .selected_target
+            .and_then(|i| self.all_targets().get(i))
+            .map(|t| t.label.clone());
+        column![
+            text("active target").size(11).color(MUTED),
+            pick_list(labels, selected, Message::SelectTargetByLabel)
+                .placeholder("none")
+                .text_size(12)
+                .padding([4, 8])
+                .width(Fill),
+        ]
+        .spacing(4)
+        .into()
     }
 
     fn targets_body(&self) -> Element<'_, Message> {
@@ -1732,6 +1863,15 @@ impl Skyde {
             let editor = text_editor(&buf.content)
                 .placeholder("start typing")
                 .on_action(Message::Edit)
+                // Tab inserts four spaces; the default binding drops it.
+                .key_binding(|kp| match kp.key.as_ref() {
+                    keyboard::Key::Named(keyboard::key::Named::Tab) => {
+                        Some(text_editor::Binding::Sequence(
+                            (0..4).map(|_| text_editor::Binding::Insert(' ')).collect(),
+                        ))
+                    }
+                    _ => text_editor::Binding::from_key_press(kp),
+                })
                 .font(NERD_FONT)
                 .size(gutter::TEXT_SIZE)
                 .line_height(LineHeight::Absolute(gutter::LINE_H.into()))
