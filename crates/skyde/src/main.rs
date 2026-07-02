@@ -21,6 +21,9 @@ use iced::{
 
 const NERD_FONT: Font = Font::with_name("MesloLGM Nerd Font Mono");
 
+/// Widget id of the context menu's new-file/new-folder name input.
+const NEW_ENTRY_INPUT: &str = "ctx-new-entry";
+
 // Nerd Font codepoints. If a glyph renders as a box, swap the codepoint here.
 const ICON_CHEVRON_RIGHT: &str = "\u{eab6}"; // nf-cod-chevron_right
 const ICON_CHEVRON_DOWN: &str = "\u{eab4}"; // nf-cod-chevron_down
@@ -119,6 +122,7 @@ struct Skyde {
     // menu. mouse_area's right-press message carries no position.
     cursor: Point,
     context: Option<(Point, CtxKind)>,
+    new_entry: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,6 +197,9 @@ enum Message {
     CloseContext,
     NewTargetIn(PathBuf),
     OpenTargetSource(usize),
+    NewEntryPrompt { dir: PathBuf, folder: bool },
+    NewEntryName(String),
+    NewEntryCreate,
 }
 
 /// One line / completion event from a streaming `buck2 build`.
@@ -208,6 +215,8 @@ enum CtxKind {
     Entry { path: PathBuf, is_dir: bool },
     Target(usize),
     Package(String),
+    /// The menu morphed into a "name this new file/folder" prompt.
+    NewEntry { dir: PathBuf, folder: bool },
 }
 
 /// Mirror cosmic-text's keep-the-cursor-in-view behaviour so the gutter
@@ -356,6 +365,7 @@ impl Skyde {
             editor_text_h: std::cell::Cell::new(600.0),
             cursor: Point::ORIGIN,
             context: None,
+            new_entry: String::new(),
         };
         // `skyde path/to/file` opens it on startup.
         let open = std::env::args()
@@ -380,6 +390,10 @@ impl Skyde {
                     keyboard::Key::Character("w") => Some(Message::CloseActiveTab),
                     _ => None,
                 },
+                iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                    ..
+                }) => Some(Message::CloseContext),
                 _ => None,
             }),
         ])
@@ -508,7 +522,7 @@ impl Skyde {
                 self.status = "new file".into();
             }
             Message::RefreshTree => {
-                self.tree = tree::read_dir(&self.root);
+                self.reload_tree();
                 self.templates = load_templates(&self.root);
                 self.index = ske::index::scan(&self.root, &self.templates);
                 self.status = "tree + templates + index refreshed".into();
@@ -726,7 +740,7 @@ impl Skyde {
                 match &kind {
                     CtxKind::Entry { path, .. } => self.selected = Some(path.clone()),
                     CtxKind::Target(i) => self.selected_target = Some(*i),
-                    CtxKind::Package(_) => {}
+                    CtxKind::Package(_) | CtxKind::NewEntry { .. } => {}
                 }
                 self.context = Some((self.cursor, kind));
             }
@@ -779,8 +793,73 @@ impl Skyde {
                 }
                 return task;
             }
+            Message::NewEntryPrompt { dir, folder } => {
+                self.new_entry.clear();
+                self.context = Some((self.cursor, CtxKind::NewEntry { dir, folder }));
+                return iced::widget::operation::focus(NEW_ENTRY_INPUT);
+            }
+            Message::NewEntryName(name) => {
+                self.new_entry = name;
+            }
+            Message::NewEntryCreate => {
+                let Some((_, CtxKind::NewEntry { dir, folder })) = self.context.take() else {
+                    return Task::none();
+                };
+                let name = self.new_entry.trim().to_owned();
+                if name.is_empty() || name.contains(std::path::is_separator) {
+                    self.status = "give it a plain name (no path separators)".into();
+                    return Task::none();
+                }
+                let path = dir.join(&name);
+                if path.exists() {
+                    self.status = format!("{name} already exists");
+                    return Task::none();
+                }
+                let result = if folder {
+                    std::fs::create_dir(&path)
+                } else {
+                    std::fs::write(&path, "")
+                };
+                match result {
+                    Ok(()) => {
+                        self.reload_tree();
+                        self.index = ske::index::scan(&self.root, &self.templates);
+                        self.selected = Some(path.clone());
+                        self.status = format!("created {name}");
+                        if !folder {
+                            return self.update(Message::Open(path));
+                        }
+                    }
+                    Err(e) => self.status = format!("create failed: {e}"),
+                }
+            }
         }
         Task::none()
+    }
+
+    /// Re-read the file tree, keeping directories expanded.
+    fn reload_tree(&mut self) {
+        fn expanded_dirs(nodes: &[tree::Node], out: &mut Vec<PathBuf>) {
+            for n in nodes {
+                if let tree::Kind::Dir {
+                    expanded: true,
+                    children,
+                } = &n.kind
+                {
+                    out.push(n.path.clone());
+                    if let Some(children) = children {
+                        expanded_dirs(children, out);
+                    }
+                }
+            }
+        }
+        let mut expanded = Vec::new();
+        expanded_dirs(&self.tree, &mut expanded);
+        self.tree = tree::read_dir(&self.root);
+        // Parents come before children, so each toggle finds its node loaded.
+        for dir in expanded {
+            tree::toggle(&mut self.tree, &dir);
+        }
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -843,13 +922,57 @@ impl Skyde {
         let mut items: Vec<Element<'_, Message>> = Vec::new();
         match kind {
             CtxKind::Entry { path, is_dir } => {
+                let is_buck = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| matches!(n, "BUCK" | "BUILD" | "BUILD.bazel"));
                 if *is_dir {
+                    items.push(item(
+                        "new file…".into(),
+                        Message::NewEntryPrompt {
+                            dir: path.clone(),
+                            folder: false,
+                        },
+                    ));
+                    items.push(item(
+                        "new folder…".into(),
+                        Message::NewEntryPrompt {
+                            dir: path.clone(),
+                            folder: true,
+                        },
+                    ));
                     items.push(item(
                         "new build target here…".into(),
                         Message::NewTargetIn(path.clone()),
                     ));
+                } else if is_buck {
+                    // Whole-package build label: "//demo:" builds every
+                    // target this BUCK file defines.
+                    let pkg = self
+                        .index
+                        .buck_files
+                        .iter()
+                        .find(|(_, f)| f.as_path() == path.as_path())
+                        .map(|(p, _)| p.clone())
+                        .or_else(|| {
+                            let base = self.buck_root.as_deref().unwrap_or(&self.root);
+                            path.parent()
+                                .and_then(|d| d.strip_prefix(base).ok())
+                                .map(|rel| format!("//{}", rel.display()))
+                        });
+                    if let Some(pkg) = pkg {
+                        items.push(item(
+                            format!("build {pkg}:"),
+                            Message::BuildTarget(format!("{pkg}:")),
+                        ));
+                    }
+                    if let Some(dir) = path.parent() {
+                        items.push(item(
+                            "add target…".into(),
+                            Message::NewTargetIn(dir.to_path_buf()),
+                        ));
+                    }
                 } else {
-                    items.push(item("open".into(), Message::Open(path.clone())));
                     let owners = self.index.targets_of(path);
                     if let Some(t) = self
                         .selected_target
@@ -862,6 +985,13 @@ impl Skyde {
                         ));
                     }
                     if let Some(dir) = path.parent() {
+                        items.push(item(
+                            "new file…".into(),
+                            Message::NewEntryPrompt {
+                                dir: dir.to_path_buf(),
+                                folder: false,
+                            },
+                        ));
                         items.push(item(
                             "new build target here…".into(),
                             Message::NewTargetIn(dir.to_path_buf()),
@@ -899,6 +1029,31 @@ impl Skyde {
                         Message::NewTargetIn(dir),
                     ));
                 }
+            }
+            CtxKind::NewEntry { dir, folder } => {
+                let rel = dir.strip_prefix(&self.root).unwrap_or(dir);
+                items.push(
+                    container(
+                        text(format!(
+                            "new {} in {}/",
+                            if *folder { "folder" } else { "file" },
+                            rel.display()
+                        ))
+                        .size(11)
+                        .color(MUTED),
+                    )
+                    .padding([2, 6])
+                    .into(),
+                );
+                items.push(
+                    text_input("name", &self.new_entry)
+                        .id(NEW_ENTRY_INPUT)
+                        .on_input(Message::NewEntryName)
+                        .on_submit(Message::NewEntryCreate)
+                        .size(12)
+                        .padding([4, 8])
+                        .into(),
+                );
             }
         }
         container(
